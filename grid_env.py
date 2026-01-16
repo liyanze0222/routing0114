@@ -113,23 +113,35 @@ class GridRoutingEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.RandomState(seed)
 
-        if self.start_goal_mode == "random":
-            (self.agent_row, self.agent_col), (self.goal_row, self.goal_col) = (
-                self._sample_distinct_positions()
-            )
-        elif self.start_goal_mode == "rect":
-            if self.start_rect is None or self.goal_rect is None:
-                raise ValueError("start_goal_mode=rect requires start_rect and goal_rect")
-            self.agent_row, self.agent_col = self._sample_from_rect(self.start_rect)
-            max_attempts = 1000
-            attempts = 0
-            while True:
-                self.goal_row, self.goal_col = self._sample_from_rect(self.goal_rect)
-                if (self.agent_row, self.agent_col) != (self.goal_row, self.goal_col):
-                    break
-                attempts += 1
-                if attempts >= max_attempts:
-                    raise RuntimeError("Failed to sample distinct start/goal within provided rectangles")
+        override_start = None
+        override_goal = None
+        if options and isinstance(options, dict):
+            override_start = options.get("override_start")
+            override_goal = options.get("override_goal")
+
+        if override_start is not None and override_goal is not None:
+            self.agent_row, self.agent_col = map(int, override_start)
+            self.goal_row, self.goal_col = map(int, override_goal)
+            if (self.agent_row, self.agent_col) == (self.goal_row, self.goal_col):
+                raise ValueError("override_start and override_goal cannot be identical")
+        else:
+            if self.start_goal_mode == "random":
+                (self.agent_row, self.agent_col), (self.goal_row, self.goal_col) = (
+                    self._sample_distinct_positions()
+                )
+            elif self.start_goal_mode == "rect":
+                if self.start_rect is None or self.goal_rect is None:
+                    raise ValueError("start_goal_mode=rect requires start_rect and goal_rect")
+                self.agent_row, self.agent_col = self._sample_from_rect(self.start_rect)
+                max_attempts = 1000
+                attempts = 0
+                while True:
+                    self.goal_row, self.goal_col = self._sample_from_rect(self.goal_rect)
+                    if (self.agent_row, self.agent_col) != (self.goal_row, self.goal_col):
+                        break
+                    attempts += 1
+                    if attempts >= max_attempts:
+                        raise RuntimeError("Failed to sample distinct start/goal within provided rectangles")
         self.steps = 0
 
         obs = self._get_obs()

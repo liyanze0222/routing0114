@@ -1,0 +1,32 @@
+{
+  "all": {
+    "count": 100,
+    "success_rate": 1.0,
+    "energy_mean": 1.3062063492063494,
+    "energy_std": 0.4409723557590814,
+    "load_mean": 0.8288861676266415,
+    "load_std": 0.788736345646865,
+    "corr": -0.0012821906384799528,
+    "violation_energy_rate": 0.33,
+    "violation_load_rate": 0.46
+  },
+  "success_only": {
+    "count": 100,
+    "success_rate": 1.0,
+    "energy_mean": 1.3062063492063494,
+    "energy_std": 0.4409723557590814,
+    "load_mean": 0.8288861676266415,
+    "load_std": 0.788736345646865,
+    "corr": -0.0012821906384799528,
+    "violation_energy_rate": 0.33,
+    "violation_load_rate": 0.46
+  },
+  "feasible_success_rate": 0.36,
+  "energy_budget": 1.35,
+  "load_budget": 0.9,
+  "mode": "fixed_map",
+  "first_map_hash": "aa74fb6b7b9c44ffe6afa0679b28787a",
+  "unique_map_hashes": [
+    "aa74fb6b7b9c44ffe6afa0679b28787a"
+  ]
+}

@@ -33,6 +33,7 @@ from typing import Any, Dict, Literal
 
 import gymnasium as gym
 import numpy as np
+import hashlib
 
 from grid_env import GridRoutingEnv
 
@@ -52,6 +53,7 @@ class GridCostWrapper(gym.Wrapper):
         congestion_density: float = 0.3,
         congestion_pattern: CongestionPattern = "random",
         load_cost_scale: float = 1.0,
+        keep_maps_across_episodes: bool = False,
     ):
         """
         Args:
@@ -74,6 +76,7 @@ class GridCostWrapper(gym.Wrapper):
         self.congestion_density = congestion_density
         self.congestion_pattern = congestion_pattern
         self.load_cost_scale = load_cost_scale
+        self.keep_maps_across_episodes = keep_maps_across_episodes
 
         # 假设 GridRoutingEnv 暴露 grid_size 属性
         self.grid_size = env.grid_size
@@ -150,10 +153,12 @@ class GridCostWrapper(gym.Wrapper):
         """重置环境，并初始化 cost_components 信息。"""
         obs, info = self.env.reset(seed=seed, options=options)
 
-        # 生成新的能耗图与拥塞图
-        self._energy_map = self._generate_energy_map()
-        # 生成新的拥塞图
-        self._congestion_map = self._generate_congestion_map()
+        # 生成或复用能耗/拥塞图
+        if self.keep_maps_across_episodes and self._energy_map is not None and self._congestion_map is not None:
+            pass
+        else:
+            self._energy_map = self._generate_energy_map()
+            self._congestion_map = self._generate_congestion_map()
 
         info = {} if info is None else dict(info)
         info["cost_components"] = {"invalid": 0.0, "energy": 0.0, "load": 0.0}
@@ -182,6 +187,28 @@ class GridCostWrapper(gym.Wrapper):
             info["congestion_mean"] = float(self._congestion_map.mean())
             info["congestion_mean_scaled"] = float(self._congestion_map.mean() * self.load_cost_scale)
             info["congestion_ratio"] = float((self._congestion_map > 0).mean())
+
+        # 添加 map hash 便于验证固定地图
+        if self._congestion_map is not None:
+            info["congestion_map_hash"] = hashlib.md5(self._congestion_map.tobytes()).hexdigest()
+        if self._energy_map is not None:
+            info["energy_map_hash"] = hashlib.md5(self._energy_map.tobytes()).hexdigest()
+        if self._congestion_map is not None and self._energy_map is not None:
+            combo = self._congestion_map.tobytes() + self._energy_map.tobytes()
+            info["map_hash"] = hashlib.md5(combo).hexdigest()
+
+        # 确保 reset 的 info 始终带上起点/终点信息，便于上层记录
+        # 若底层 env 已写入，则直接复用；否则从当前状态补充
+        start_pos = info.get("start") or info.get("start_pos")
+        goal_pos = info.get("goal") or info.get("goal_pos")
+        if start_pos is None:
+            start_pos = (getattr(self.env, "agent_row", None), getattr(self.env, "agent_col", None))
+            info["start"] = start_pos
+            info["start_pos"] = start_pos
+        if goal_pos is None:
+            goal_pos = (getattr(self.env, "goal_row", None), getattr(self.env, "goal_col", None))
+            info["goal"] = goal_pos
+            info["goal_pos"] = goal_pos
 
         return obs, info
 
