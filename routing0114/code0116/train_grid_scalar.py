@@ -1,0 +1,357 @@
+"""
+train_grid_scalar.py
+
+Training script for Scalar PPO (V5 Baseline for Ablation Study)
+
+Key Difference from Multi-Head PPO:
+- Scalarizes reward BEFORE passing to agent: scalar_reward = R - α*C_E - β*C_L
+- Uses single value head (no separate cost critics)
+- No Lagrangian updates
+
+Usage:
+python train_grid_scalar.py --energy_weight 0.5 --load_weight 2.0 --total_iters 800
+"""
+
+import argparse
+import json
+import os
+import time
+from typing import Any, Dict, List
+
+import numpy as np
+import torch
+
+from grid_env import GridRoutingEnv
+from grid_cost_env import GridCostWrapper
+from grid_hard_wrapper import GridHardWrapper
+from grid_congestion_obs_wrapper import GridCongestionObsWrapper
+from grid_energy_obs_wrapper import GridEnergyObsWrapper
+from ppo_scalar import ScalarPPOConfig, ScalarPPO
+from utils import set_seed, MetricsLogger, plot_training_curves, make_output_dir
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Scalar PPO (V5 Baseline) - Weighted Sum of Costs"
+    )
+    
+    # ========== 基础设置 ==========
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--total_iters", type=int, default=800, help="总训练迭代次数")
+    parser.add_argument("--batch_size", type=int, default=2048, help="每次采样的步数")
+    parser.add_argument("--minibatch_size", type=int, default=256, help="minibatch 大小")
+    parser.add_argument("--update_epochs", type=int, default=10, help="每个 batch 更新轮数")
+    
+    # ========== 环境设置 ==========
+    parser.add_argument("--grid_size", type=int, default=8, help="网格大小")
+    parser.add_argument("--step_penalty", type=float, default=-1.0, help="每步基础惩罚")
+    parser.add_argument("--max_steps", type=int, default=256, help="episode 最大步数")
+    parser.add_argument("--success_reward", type=float, default=20.0, help="成功奖励")
+    
+    parser.add_argument("--energy_high_cost", type=float, default=3.0, help="高能耗区域成本")
+    parser.add_argument("--energy_high_density", type=float, default=0.2, help="高能耗区域密度")
+    parser.add_argument("--congestion_density", type=float, default=0.3, help="拥塞密度")
+    parser.add_argument(
+        "--congestion_pattern", type=str, default="random",
+        choices=["random", "block"], help="拥塞模式"
+    )
+    parser.add_argument("--load_cost_scale", type=float, default=1.0, help="load cost 缩放系数")
+    
+    # ========== 观测增强 ==========
+    parser.add_argument(
+        "--include_congestion_obs", type=lambda x: x.lower() == "true", default=False,
+        help="是否包含拥塞观测"
+    )
+    parser.add_argument("--congestion_patch_radius", type=int, default=2, help="拥塞 patch 半径")
+    parser.add_argument(
+        "--include_energy_obs", type=lambda x: x.lower() == "true", default=False,
+        help="是否包含能耗观测"
+    )
+    parser.add_argument("--energy_patch_radius", type=int, default=1, help="能耗 patch 半径")
+    parser.add_argument(
+        "--energy_obs_normalize", type=lambda x: x.lower() == "true", default=True,
+        help="是否归一化能耗观测"
+    )
+    
+    # ========== Cost Weights (关键参数) ==========
+    parser.add_argument(
+        "--energy_weight", type=float, default=0.0,
+        help="Energy cost 权重 α (scalar_reward = R - α*C_E - β*C_L)"
+    )
+    parser.add_argument(
+        "--load_weight", type=float, default=0.0,
+        help="Load cost 权重 β (scalar_reward = R - α*C_E - β*C_L)"
+    )
+    
+    # ========== PPO 超参 ==========
+    parser.add_argument("--hidden_dim", type=int, default=128, help="隐藏层维度")
+    parser.add_argument("--lr", type=float, default=3e-4, help="学习率")
+    parser.add_argument("--gamma", type=float, default=0.99, help="折扣因子")
+    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE λ")
+    parser.add_argument("--clip_coef", type=float, default=0.2, help="PPO clip 系数")
+    parser.add_argument("--ent_coef", type=float, default=0.01, help="熵正则系数")
+    parser.add_argument("--value_coef", type=float, default=0.5, help="value loss 系数")
+    parser.add_argument("--max_grad_norm", type=float, default=0.5, help="梯度裁剪")
+    
+    # ========== 输出与日志 ==========
+    parser.add_argument("--output_dir", type=str, default="scalar_ppo_output", help="输出目录")
+    parser.add_argument("--run_tag", type=str, default=None, help="运行标签")
+    parser.add_argument("--log_interval", type=int, default=10, help="日志间隔")
+    parser.add_argument("--save_model", action="store_true", help="是否保存模型")
+    
+    return parser.parse_args()
+
+
+def _build_env(args):
+    """构建环境"""
+    max_steps = args.max_steps if args.max_steps > 0 else 4 * args.grid_size * args.grid_size
+    
+    base_env = GridRoutingEnv(
+        grid_size=args.grid_size,
+        step_penalty=args.step_penalty,
+        success_reward=args.success_reward,
+        max_steps=max_steps,
+    )
+    env = GridCostWrapper(
+        base_env,
+        energy_base=1.0,
+        energy_high_cost=args.energy_high_cost,
+        energy_high_density=args.energy_high_density,
+        congestion_density=args.congestion_density,
+        congestion_pattern=args.congestion_pattern,
+        load_cost_scale=args.load_cost_scale,
+    )
+    env = GridHardWrapper(env)
+    if args.include_congestion_obs:
+        env = GridCongestionObsWrapper(env, patch_radius=args.congestion_patch_radius)
+    if args.include_energy_obs:
+        env = GridEnergyObsWrapper(
+            env, patch_radius=args.energy_patch_radius, normalize=args.energy_obs_normalize
+        )
+    return env
+
+
+def main():
+    args = parse_args()
+    
+    # 设置随机种子
+    set_seed(args.seed)
+    
+    # 创建输出目录
+    output_dir = make_output_dir(args.output_dir, args.run_tag)
+    print(f"Output directory: {output_dir}")
+    
+    # 保存配置
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f, indent=2)
+    print(f"Config saved to: {config_path}")
+    
+    # 构建环境
+    env = _build_env(args)
+    
+    # 获取观测/动作维度
+    obs_sample, info = env.reset(seed=args.seed)
+    obs_dim = obs_sample.shape[0] if hasattr(obs_sample, 'shape') else len(obs_sample)
+    act_dim = 4
+    action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+    
+    print(f"\n========== Environment Info ==========")
+    print(f"Observation dim: {obs_dim}")
+    print(f"Action dim: {act_dim}")
+    print(f"Grid size: {args.grid_size}")
+    print(f"Max steps: {args.max_steps if args.max_steps > 0 else 4 * args.grid_size ** 2}")
+    print(f"Energy weight α: {args.energy_weight}")
+    print(f"Load weight β: {args.load_weight}")
+    print(f"Load cost scale: {args.load_cost_scale}")
+    print("=" * 40 + "\n")
+    
+    # 设备
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}\n")
+    
+    # 构建配置
+    config = ScalarPPOConfig(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        hidden_dim=args.hidden_dim,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_coef=args.clip_coef,
+        ent_coef=args.ent_coef,
+        value_coef=args.value_coef,
+        max_grad_norm=args.max_grad_norm,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        minibatch_size=args.minibatch_size,
+        update_epochs=args.update_epochs,
+        device=device,
+    )
+    
+    # 创建 Agent
+    agent = ScalarPPO(config)
+    
+    # 初始化 Logger
+    logger = MetricsLogger()
+    
+    # 训练状态
+    episode_returns: List[float] = []
+    episode_lengths: List[int] = []
+    episode_successes: List[bool] = []
+    
+    # Episode 统计（用于计算 avg_cost）
+    episode_energy_costs: List[float] = []
+    episode_load_costs: List[float] = []
+    
+    # 初始 reset
+    obs, info = env.reset(seed=args.seed)
+    action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+    
+    # 训练循环
+    ep_ret = 0.0
+    ep_len = 0
+    ep_energy = 0.0
+    ep_load = 0.0
+    
+    start_time = time.time()
+    
+    print("=" * 70)
+    print("Starting training...")
+    print("=" * 70 + "\n")
+    
+    for iteration in range(1, args.total_iters + 1):
+        # Rollout
+        for _ in range(config.batch_size):
+            # 选择动作
+            action, log_prob, value = agent.get_action(obs, action_mask)
+            
+            # 环境交互
+            next_obs, env_reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            
+            # 提取 cost components
+            cost_components = info.get("cost_components", {})
+            energy_cost = cost_components.get("energy", 0.0)
+            load_cost = cost_components.get("load", 0.0)
+            
+            # *** 关键：Scalarize Reward ***
+            scalar_reward = env_reward - args.energy_weight * energy_cost - args.load_weight * load_cost
+            
+            # 收集数据（使用标量化的 reward）
+            agent.collect_rollout(
+                obs=obs,
+                action=action,
+                reward=scalar_reward,
+                done=done,
+                log_prob=log_prob,
+                action_mask=action_mask,
+                value=value,
+            )
+            
+            # 更新 episode 统计
+            ep_ret += env_reward  # 记录原始 reward
+            ep_len += 1
+            ep_energy += energy_cost
+            ep_load += load_cost
+            
+            # 更新状态
+            obs = next_obs
+            action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+            
+            if done:
+                # Episode 结束
+                episode_returns.append(ep_ret)
+                episode_lengths.append(ep_len)
+                episode_successes.append(terminated)
+                episode_energy_costs.append(ep_energy)
+                episode_load_costs.append(ep_load)
+                
+                # Reset
+                obs, info = env.reset()
+                action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+                ep_ret = 0.0
+                ep_len = 0
+                ep_energy = 0.0
+                ep_load = 0.0
+        
+        # 计算 GAE
+        advantages, returns = agent.compute_gae(obs, False, action_mask)
+        
+        # 更新策略
+        metrics = agent.update(advantages, returns)
+        
+        # 日志记录
+        if iteration % args.log_interval == 0:
+            elapsed = time.time() - start_time
+            total_steps = iteration * config.batch_size
+            
+            # 计算统计量
+            avg_return = np.mean(episode_returns[-100:]) if episode_returns else 0.0
+            avg_length = np.mean(episode_lengths[-100:]) if episode_lengths else 0.0
+            success_rate = np.mean(episode_successes[-100:]) if episode_successes else 0.0
+            
+            # *** 关键：计算 per-step mean cost（与 Multi-Head 口径一致）***
+            avg_cost_energy = 0.0
+            avg_cost_load = 0.0
+            if len(episode_energy_costs) > 0 and len(episode_lengths) > 0:
+                # 取最近 100 个 episode
+                recent_energy = episode_energy_costs[-100:]
+                recent_load = episode_load_costs[-100:]
+                recent_lengths = episode_lengths[-100:]
+                
+                # Per-step mean
+                avg_cost_energy = np.mean([e / max(1, l) for e, l in zip(recent_energy, recent_lengths)])
+                avg_cost_load = np.mean([ld / max(1, l) for ld, l in zip(recent_load, recent_lengths)])
+            
+            # 构造日志
+            log_entry = {
+                "iteration": iteration,
+                "total_steps": total_steps,
+                "elapsed_time": elapsed,
+                "avg_return": float(avg_return),
+                "avg_length": float(avg_length),
+                "success_rate": float(success_rate),
+                "avg_cost_energy": float(avg_cost_energy),
+                "avg_cost_load": float(avg_cost_load),
+                "policy_loss": metrics["policy_loss"],
+                "value_loss": metrics["value_loss"],
+                "entropy": metrics["entropy"],
+                "approx_kl": metrics.get("approx_kl", 0.0),
+                "energy_weight": args.energy_weight,
+                "load_weight": args.load_weight,
+            }
+            
+            logger.log(log_entry)
+            
+            # 打印
+            print("=" * 70)
+            print(f"Iteration {iteration}/{args.total_iters} | Steps: {total_steps} | Time: {elapsed:.1f}s")
+            print(f"Avg Return: {avg_return:.2f} | Avg Length: {avg_length:.1f} | Success Rate: {success_rate:.2%}")
+            print(f"Cost (energy): {avg_cost_energy:.4f} | Cost (load): {avg_cost_load:.4f}")
+            print(f"Weights: α={args.energy_weight:.2f}, β={args.load_weight:.2f}")
+            print("-" * 70)
+            print(f"Policy Loss: {metrics['policy_loss']:.4f} | Value Loss: {metrics['value_loss']:.4f} | Entropy: {metrics['entropy']:.4f}")
+            print("=" * 70 + "\n")
+    
+    # 保存日志
+    logger.save(os.path.join(output_dir, "metrics.json"))
+    print(f"Metrics saved to: {os.path.join(output_dir, 'metrics.json')}")
+    
+    # 绘制曲线
+    plot_path = os.path.join(output_dir, "training_curves.png")
+    plot_training_curves(logger.get_data(), plot_path)
+    print(f"Training curves saved to: {plot_path}")
+    
+    # 保存模型
+    if args.save_model:
+        model_path = os.path.join(output_dir, "model.pt")
+        agent.save(model_path)
+        print(f"Model saved to: {model_path}")
+    
+    print("\n" + "=" * 70)
+    print("Training completed!")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
