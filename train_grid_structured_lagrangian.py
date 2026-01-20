@@ -35,6 +35,7 @@ python train_grid_structured_lagrangian.py --use_lagrange True \\
 """
 
 import argparse
+import copy
 import json
 import os
 import time
@@ -48,8 +49,10 @@ from grid_cost_env import GridCostWrapper
 from grid_hard_wrapper import GridHardWrapper
 from grid_congestion_obs_wrapper import GridCongestionObsWrapper
 from grid_energy_obs_wrapper import GridEnergyObsWrapper
+from grid_obs_norm_wrapper import GridObsNormWrapper
 from ppo_multi_agent import MultiCriticPPOConfig, MultiCriticPPO
 from utils import set_seed, MetricsLogger, plot_training_curves, plot_safety_gym_curves, make_output_dir, save_grid_route_viz
+from check_cost_units import run_cost_unit_check
 
 
 class CurriculumScheduler:
@@ -164,6 +167,10 @@ def parse_args():
         "--energy_obs_normalize", type=lambda x: x.lower() == "true", default=True,
         help="energy patch 是否归一化到 [0,1]"
     )
+    parser.add_argument(
+        "--obs_rms", type=lambda x: x.lower() == "true", default=False,
+        help="是否对全局观测做 RunningMeanStd 归一化 (GridObsNormWrapper)"
+    )
 
     # ========== Seed Replay / Curriculum 设置 ==========
     parser.add_argument(
@@ -193,6 +200,33 @@ def parse_args():
         "--lambda_gap_mode", type=str, default="absolute",
         choices=["absolute", "ratio"],
         help="λ 更新时 gap 的尺度：absolute=原始差值，ratio=相对比例"
+    )
+    parser.add_argument(
+        "--risk_factor", type=float, default=0.0,
+        help="风险敏感成本 = mean + risk_factor * std；0 表示关闭风险加成"
+    )
+
+    # ========== Dual(λ) 更新模式（向后兼容：默认 standard） ==========
+    parser.add_argument(
+        "--dual_update_mode", type=str, default="standard",
+        choices=["standard", "hysteresis", "decorrelated", "both"],
+        help="dual 更新模式：standard=旧行为；hysteresis=gap EMA+死区+滞回；decorrelated=相关性消耦；both=先消耦再滞回"
+    )
+    parser.add_argument(
+        "--dual_gap_ema_beta", type=float, default=0.10,
+        help="dual gap EMA 平滑系数（推荐 0.05~0.2）"
+    )
+    parser.add_argument(
+        "--dual_deadband", type=float, default=0.02,
+        help="dual hysteresis 模式的死区阈值（ratio gap）"
+    )
+    parser.add_argument(
+        "--dual_lr_down_scale", type=float, default=0.20,
+        help="dual hysteresis 模式下降速度 = 上升速度 * scale"
+    )
+    parser.add_argument(
+        "--dual_corr_ema_beta", type=float, default=0.05,
+        help="dual decorrelated 模式相关性估计的 EMA 系数"
     )
 
     # ========== 约束预算 ==========
@@ -297,6 +331,18 @@ def parse_args():
         help="B: Best feasible 的成功率门槛（防止早期假可行污染）"
     )
     parser.add_argument(
+        "--best_window_fsr", type=int, default=50,
+        help="B: Best FSR 使用的窗口大小（最近 W 个 episode，可行率 tie-breaker 对齐）"
+    )
+    parser.add_argument(
+        "--best_window_tail", type=int, default=50,
+        help="B: Tail-score 使用的最近成功 episode 数（默认 50）"
+    )
+    parser.add_argument(
+        "--tail_percentile", type=float, default=95.0,
+        help="B: Tail-score 百分位（默认 95，计算成功 episode per-step cost 的 p95）"
+    )
+    parser.add_argument(
         "--enable_early_stop", type=lambda x: x.lower() == "true", default=False,
         help="C: 启用早停（当约束稳定时停止训练，默认 False）"
     )
@@ -335,6 +381,16 @@ def parse_args():
     )
     parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
     parser.add_argument("--save_model", action="store_true", help="是否保存模型")
+
+    # ========== 调试 / 量纲核查 ==========
+    parser.add_argument(
+        "--unit_check", action="store_true", default=False,
+        help="开启量纲一致性核查（仅打印/导出，不影响训练）"
+    )
+    parser.add_argument(
+        "--unit_check_episodes", type=int, default=1,
+        help="unit_check 模式下随机采样的 episode 数"
+    )
 
     # ========== 可视化设置 ==========
     parser.add_argument("--vis_interval", type=int, default=0, help="每隔多少 iter 保存一次网格可视化(0=关闭)")
@@ -390,6 +446,9 @@ def _build_env(args):
         env = GridCongestionObsWrapper(env, patch_radius=args.congestion_patch_radius)
     if args.include_energy_obs:
         env = GridEnergyObsWrapper(env, patch_radius=args.energy_patch_radius, normalize=args.energy_obs_normalize)
+    if args.obs_rms:
+        env = GridObsNormWrapper(env)
+        print("✅ GridObsNormWrapper (Dynamic RunningMeanStd) Attached!")
     return env
 
 
@@ -417,6 +476,70 @@ def _find_cost_wrapper(e):
         if isinstance(x, GridCostWrapper):
             return x
     return None
+
+
+def _clone_to_cpu_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep-copy a state_dict and move tensors to CPU for safe serialization."""
+    out = {}
+    for k, v in state_dict.items():
+        if torch.is_tensor(v):
+            out[k] = v.detach().cpu().clone()
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def _find_obs_stats(e):
+    cur = e
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if hasattr(cur, "obs_rms"):
+            return cur.obs_rms
+        cur = getattr(cur, "env", None)
+    return None
+
+
+def get_checkpoint_state(agent, env, config, meta=None):
+    if hasattr(agent, "actor"):
+        model_sd = agent.actor.state_dict()
+    elif hasattr(agent, "network"):
+        model_sd = _clone_to_cpu_state_dict(agent.network.state_dict())
+    else:
+        raise AttributeError("Agent has no actor/network state_dict for checkpointing")
+
+    critic_sd = agent.critic.state_dict() if hasattr(agent, "critic") else None
+
+    opt_sd = None
+    if hasattr(agent, "optimizer"):
+        try:
+            opt_sd = copy.deepcopy(agent.optimizer.state_dict())
+        except Exception:
+            opt_sd = None
+
+    state = {
+        "model_state_dict": model_sd,
+        "critic_state_dict": critic_sd,
+        "optimizer_state_dict": opt_sd,
+        "config": config.__dict__ if hasattr(config, "__dict__") else config,
+        "obs_stats": _find_obs_stats(env),
+    }
+    if hasattr(agent, "network"):
+        state["network_state_dict"] = _clone_to_cpu_state_dict(agent.network.state_dict())
+    if meta:
+        state.update(meta)
+    return state
+
+
+def _clone_to_cpu_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep-copy a flat dict and move any tensors to CPU."""
+    out = {}
+    for k, v in d.items():
+        if torch.is_tensor(v):
+            out[k] = v.detach().cpu().clone()
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
 
 
 def rollout_for_viz(agent, env, seed: int, deterministic: bool):
@@ -486,6 +609,26 @@ def main():
     output_dir = make_output_dir(args.output_dir, args.run_tag)
     # 更新 args 以便后续保存 config.json 时记录最终目录
     args.final_output_dir = output_dir
+
+    # 可选：训练前执行量纲一致性核查（不会修改训练逻辑）
+    if args.unit_check:
+        print("[UnitCheck] Running cost unit consistency check before training...")
+        try:
+            summary, _ = run_cost_unit_check(
+                vars(args),
+                episodes=args.unit_check_episodes,
+                seed=args.seed,
+                csv_path=os.path.join(output_dir, "unit_check_steps.csv"),
+                quiet=True,
+            )
+            summary_path = os.path.join(output_dir, "unit_check_summary.json")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            print(f"[UnitCheck] Summary saved to {summary_path}")
+        except Exception as e:
+            print(f"[UnitCheck] Failed to run unit check: {e}")
+        # 重新设定随机种子，避免对后续训练产生影响
+        set_seed(args.seed)
 
     # ========== 构建环境 ==========
     env = _build_env(args)
@@ -559,6 +702,8 @@ def main():
     print(f"Budgets: energy={args.energy_budget:.3f}, load={args.load_budget:.3f}")
     print(f"Initial lambda: energy={args.initial_lambda_energy:.3f}, "
           f"load={args.initial_lambda_load:.3f}")
+    if args.risk_factor > 0:
+        print(f"Risk-sensitive dual update enabled: risk_factor={args.risk_factor}")
     if args.use_lagrange:
         lr_energy = args.lambda_lr_energy if args.lambda_lr_energy is not None else args.lambda_lr
         lr_load = args.lambda_lr_load if args.lambda_lr_load is not None else args.lambda_lr
@@ -661,6 +806,13 @@ def main():
         lambda_deadzone_up=args.lambda_deadzone_up,
         lambda_deadzone_down=args.lambda_deadzone_down,
         lambda_gap_mode=args.lambda_gap_mode,
+        risk_factor=args.risk_factor,
+        # dual 更新模式
+        dual_update_mode=args.dual_update_mode,
+        dual_gap_ema_beta=args.dual_gap_ema_beta,
+        dual_deadband=args.dual_deadband,
+        dual_lr_down_scale=args.dual_lr_down_scale,
+        dual_corr_ema_beta=args.dual_corr_ema_beta,
         # cost critic 模式
         cost_critic_mode=args.cost_critic_mode,
         value_head_mode=args.value_head_mode,
@@ -748,6 +900,19 @@ def main():
     best_feasible_return = -float("inf")
     best_feasible_iter = None
     best_feasible_state = None  # 保存 agent 状态的快照
+    # ========== B2: Best FSR / Tail Checkpoint 状态 ==========
+    best_fsr_value = -float("inf")
+    best_fsr_iter = None
+    best_fsr_return = -float("inf")
+    best_fsr_state = None
+
+    best_tail_value = float("inf")
+    best_tail_iter = None
+    best_tail_return = -float("inf")
+    best_tail_fsr = -float("inf")
+    best_tail_state = None
+    best_tail_energy_p95 = None
+    best_tail_load_p95 = None
 
     # ========== C: Early Stop 状态 ==========
     gap_history: Dict[str, List[float]] = {"energy": [], "load": []}
@@ -862,12 +1027,39 @@ def main():
             "kkt_energy": metrics.get("kkt_energy", metrics["lambda_energy"] * (metrics["avg_cost_energy"] - args.energy_budget)),
             "kkt_load": metrics.get("kkt_load", metrics["lambda_load"] * (metrics["avg_cost_load"] - args.load_budget)),
         }
+        # 风险敏感指标（若开启）
+        for key in [
+            "std_cost_energy",
+            "std_cost_load",
+            "risk_cost_energy",
+            "risk_cost_load",
+            "risk_gap_energy",
+            "risk_gap_load",
+            "risk_gap_ratio_energy",
+            "risk_gap_ratio_load",
+            "risk_kkt_energy",
+            "risk_kkt_load",
+        ]:
+            if key in metrics:
+                log_entry[key] = metrics[key]
         if "gap_ratio_energy" in metrics:
             log_entry["gap_ratio_energy"] = metrics["gap_ratio_energy"]
         if "gap_ratio_load" in metrics:
             log_entry["gap_ratio_load"] = metrics["gap_ratio_load"]
         if "lambda_gap_mode" in metrics:
             log_entry["lambda_gap_mode"] = metrics["lambda_gap_mode"]
+        # dual 更新诊断
+        for key in [
+            "gap_energy_raw",
+            "gap_load_raw",
+            "gap_energy_ema",
+            "gap_load_ema",
+            "gap_energy_used",
+            "gap_load_used",
+            "corr_gap_ema",
+        ]:
+            if key in metrics:
+                log_entry[key] = metrics[key]
         # 添加 EMA gap（如果存在）
         if "ema_gap_energy" in metrics:
             log_entry["ema_gap_energy"] = metrics["ema_gap_energy"]
@@ -918,7 +1110,119 @@ def main():
             log_entry["feasible_success_count"] = feasible_success_count
             log_entry["num_success_episodes"] = len(success_episodes)
             log_entry["num_episodes_buffer"] = len(train_infos_buffer)
-        
+
+        # ========== B2: Best FSR / Tail 计算与存档 ==========
+        window_fsr = args.best_window_fsr
+        episodes_window = train_infos_buffer if window_fsr <= 0 else train_infos_buffer[-window_fsr:]
+        has_window_data = len(episodes_window) > 0
+        feasible_success_count_w = 0
+        success_count_w = 0
+        for ep in episodes_window:
+            if ep.get('success', False):
+                success_count_w += 1
+                ep_len = max(1, ep['episode_length'])
+                e_mean = ep['episode_cost_energy'] / ep_len
+                l_mean = ep['episode_cost_load'] / ep_len
+                if e_mean <= args.energy_budget and l_mean <= args.load_budget:
+                    feasible_success_count_w += 1
+        feasible_success_rate_window = feasible_success_count_w / max(1, len(episodes_window))
+        window_returns = [ep['episode_return'] for ep in episodes_window]
+        avg_return_window = float(np.mean(window_returns)) if window_returns else 0.0
+
+        tail_k = args.best_window_tail
+        success_tail_eps = [ep for ep in train_infos_buffer if ep.get('success', False)]
+        if tail_k > 0:
+            success_tail_eps = success_tail_eps[-tail_k:]
+        energy_rates = [ep['episode_cost_energy'] / max(1, ep['episode_length']) for ep in success_tail_eps]
+        load_rates = [ep['episode_cost_load'] / max(1, ep['episode_length']) for ep in success_tail_eps]
+        min_tail_samples = max(10, int(tail_k / 5) if tail_k > 0 else 10)
+        energy_p95 = None
+        load_p95 = None
+        tail_score = None
+        if len(energy_rates) >= min_tail_samples and len(load_rates) >= min_tail_samples:
+            energy_p95 = float(np.percentile(energy_rates, args.tail_percentile))
+            load_p95 = float(np.percentile(load_rates, args.tail_percentile))
+            if args.energy_budget > 0 and args.load_budget > 0:
+                tail_score = max(energy_p95 / args.energy_budget, load_p95 / args.load_budget)
+
+        if args.enable_best_checkpoint and has_window_data:
+            fsr_improved = (
+                feasible_success_rate_window > best_fsr_value + 1e-6
+                or (
+                    abs(feasible_success_rate_window - best_fsr_value) < 1e-6
+                    and avg_return_window > best_fsr_return + 1e-6
+                )
+            )
+            if fsr_improved:
+                best_fsr_value = feasible_success_rate_window
+                best_fsr_iter = iteration
+                best_fsr_return = avg_return_window
+                best_fsr_state = get_checkpoint_state(
+                    agent,
+                    env,
+                    args,
+                    meta={
+                        "lambdas": _clone_to_cpu_dict(agent.lambdas),
+                        "ema_gaps": _clone_to_cpu_dict(agent.ema_gaps),
+                        "iter_count": agent._iter_count,
+                        "best_return": best_fsr_return,
+                        "best_iter": best_fsr_iter,
+                        "gap_energy": log_entry["gap_energy"],
+                        "gap_load": log_entry["gap_load"],
+                        "best_fsr_value": best_fsr_value,
+                        "best_tail_value": best_tail_value,
+                        "energy_p95": energy_p95,
+                        "load_p95": load_p95,
+                        "tail_score": tail_score,
+                    },
+                )
+
+            tail_score_value = tail_score if tail_score is not None else float("inf")
+            tail_improved = (
+                tail_score_value < best_tail_value - 1e-6
+                or (
+                    abs(tail_score_value - best_tail_value) < 1e-6
+                    and feasible_success_rate_window > best_tail_fsr + 1e-6
+                )
+                or (
+                    abs(tail_score_value - best_tail_value) < 1e-6
+                    and abs(feasible_success_rate_window - best_tail_fsr) < 1e-6
+                    and avg_return_window > best_tail_return + 1e-6
+                )
+            )
+            if tail_improved:
+                best_tail_value = tail_score_value
+                best_tail_iter = iteration
+                best_tail_return = avg_return_window
+                best_tail_fsr = feasible_success_rate_window
+                best_tail_energy_p95 = energy_p95
+                best_tail_load_p95 = load_p95
+                best_tail_state = get_checkpoint_state(
+                    agent,
+                    env,
+                    args,
+                    meta={
+                        "lambdas": _clone_to_cpu_dict(agent.lambdas),
+                        "ema_gaps": _clone_to_cpu_dict(agent.ema_gaps),
+                        "iter_count": agent._iter_count,
+                        "best_return": best_tail_return,
+                        "best_iter": best_tail_iter,
+                        "gap_energy": log_entry["gap_energy"],
+                        "gap_load": log_entry["gap_load"],
+                        "best_fsr_value": best_fsr_value,
+                        "best_tail_value": best_tail_value,
+                        "energy_p95": energy_p95,
+                        "load_p95": load_p95,
+                        "tail_score": tail_score,
+                    },
+                )
+
+        log_entry["energy_p95_last50"] = energy_p95
+        log_entry["load_p95_last50"] = load_p95
+        log_entry["tail_score_last50"] = tail_score
+        log_entry["best_fsr_iter"] = best_fsr_iter
+        log_entry["best_tail_iter"] = best_tail_iter
+
         logger.log(log_entry)
 
         # ========== B: Best Feasible Checkpoint 逻辑 ==========
@@ -932,18 +1236,20 @@ def main():
                 best_feasible_return = avg_return
                 best_feasible_iter = iteration
                 # 保存 agent 状态的快照（深拷贝）
-                import copy
-                best_feasible_state = {
-                    "network_state_dict": copy.deepcopy(agent.network.state_dict()),
-                    "optimizer_state_dict": copy.deepcopy(agent.optimizer.state_dict()),
-                    "lambdas": copy.deepcopy(agent.lambdas),
-                    "ema_gaps": copy.deepcopy(agent.ema_gaps),
-                    "iter_count": agent._iter_count,
-                    "best_return": best_feasible_return,
-                    "best_iter": best_feasible_iter,
-                    "gap_energy": gap_energy,
-                    "gap_load": gap_load,
-                }
+                best_feasible_state = get_checkpoint_state(
+                    agent,
+                    env,
+                    args,
+                    meta={
+                        "lambdas": _clone_to_cpu_dict(agent.lambdas),
+                        "ema_gaps": _clone_to_cpu_dict(agent.ema_gaps),
+                        "iter_count": agent._iter_count,
+                        "best_return": best_feasible_return,
+                        "best_iter": best_feasible_iter,
+                        "gap_energy": gap_energy,
+                        "gap_load": gap_load,
+                    },
+                )
 
         # ========== C: Early Stop 逻辑 ==========
         if args.enable_early_stop and not early_stopped:
@@ -1038,6 +1344,12 @@ def main():
             print(f"Cost (load):   {metrics['avg_cost_load']:.4f} "
                   f"(budget: {args.load_budget:.4f}, "
                   f"gap: {metrics['avg_cost_load'] - args.load_budget:+.4f})")
+            if args.risk_factor > 0 and "risk_cost_energy" in metrics:
+                print(f"Risk cost (energy): {metrics['risk_cost_energy']:.4f} "
+                    f"(gap: {metrics['risk_gap_energy']:+.4f})")
+            if args.risk_factor > 0 and "risk_cost_load" in metrics:
+                print(f"Risk cost (load):   {metrics['risk_cost_load']:.4f} "
+                    f"(gap: {metrics['risk_gap_load']:+.4f})")
             print("-" * 70)
             # [新增] Safety Gym 风格指标打印
             print(f"Success-only costs: Energy={avg_energy_success:.4f}, Load={avg_load_success:.4f}")
@@ -1090,6 +1402,16 @@ def main():
           f"load={agent.lambdas['load']:.4f}")
     if best_feasible_iter is not None:
         print(f"Best feasible: iter={best_feasible_iter}, return={best_feasible_return:.2f}")
+    if best_fsr_iter is not None:
+        print(f"Best FSR: iter={best_fsr_iter}, fsr={best_fsr_value:.4f}, return={best_fsr_return:.2f}")
+    if best_tail_iter is not None:
+        tail_energy_disp = best_tail_energy_p95 if best_tail_energy_p95 is not None else float('nan')
+        tail_load_disp = best_tail_load_p95 if best_tail_load_p95 is not None else float('nan')
+        print(
+            f"Best tail: iter={best_tail_iter}, tail_score={best_tail_value:.4f}, "
+            f"fsr={best_tail_fsr:.4f}, return={best_tail_return:.2f}, "
+            f"p95_energy={tail_energy_disp:.4f}, p95_load={tail_load_disp:.4f}"
+        )
     print("=" * 70)
 
     # ========== 保存结果 ==========
@@ -1107,6 +1429,15 @@ def main():
         "early_stop_iter": early_stop_iter,
         "best_feasible_iter": best_feasible_iter,
         "best_feasible_return": best_feasible_return if best_feasible_iter else None,
+        "best_fsr_iter": best_fsr_iter,
+        "best_fsr_value": best_fsr_value if best_fsr_iter else None,
+        "best_fsr_return": best_fsr_return if best_fsr_iter else None,
+        "best_tail_iter": best_tail_iter,
+        "best_tail_value": best_tail_value if best_tail_iter else None,
+        "best_tail_return": best_tail_return if best_tail_iter else None,
+        "best_tail_energy_p95": best_tail_energy_p95 if best_tail_iter else None,
+        "best_tail_load_p95": best_tail_load_p95 if best_tail_iter else None,
+        "best_tail_fsr": best_tail_fsr if best_tail_iter else None,
     }
     # 记录 seed replay 的实际配置
     config_dict["seed_replay"] = {
@@ -1128,11 +1459,12 @@ def main():
     safety_gym_path = os.path.join(output_dir, "safety_gym_curves.png")
     plot_safety_gym_curves(logger.get_data(), safety_gym_path)
 
-    # 保存模型（最终模型）
+    # 保存模型（最终模型，含 optimizer 与 obs 归一化统计）
     if args.save_model:
-        model_path = os.path.join(output_dir, "model.pt")
-        agent.save(model_path)
-        print(f"Model saved to: {model_path}")
+        checkpoint = get_checkpoint_state(agent, env, args)
+        ckpt_path = os.path.join(output_dir, "checkpoint_final.pt")
+        torch.save(checkpoint, ckpt_path)
+        print("✅ Checkpoint (Model + Obs Stats) saved.")
 
     # 保存 Best Feasible Checkpoint
     if args.enable_best_checkpoint and best_feasible_state is not None:
@@ -1155,6 +1487,56 @@ def main():
                 "gap_load": best_feasible_state['gap_load'],
             }, f, indent=2, ensure_ascii=False)
         print(f"Best feasible metadata saved to: {best_meta_path}")
+
+    # 保存 Best FSR Checkpoint
+    if args.enable_best_checkpoint and best_fsr_state is not None:
+        best_fsr_path = os.path.join(output_dir, "best_fsr.pt")
+        torch.save(best_fsr_state, best_fsr_path)
+        print(f"Best FSR model saved to: {best_fsr_path}")
+        print(f"  -> iter={best_fsr_iter}, fsr={best_fsr_value:.4f}, return={best_fsr_return:.2f}")
+
+        best_fsr_meta_path = os.path.join(output_dir, "best_fsr_meta.json")
+        with open(best_fsr_meta_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "iter": best_fsr_iter,
+                "feasible_success_rate": best_fsr_value,
+                "avg_return": best_fsr_return,
+                "window": args.best_window_fsr,
+                "tail_window": args.best_window_tail,
+                "tail_percentile": args.tail_percentile,
+                "energy_p95": best_fsr_state.get("energy_p95"),
+                "load_p95": best_fsr_state.get("load_p95"),
+                "tail_score": best_fsr_state.get("tail_score"),
+                "energy_budget": args.energy_budget,
+                "load_budget": args.load_budget,
+            }, f, indent=2, ensure_ascii=False)
+        print(f"Best FSR metadata saved to: {best_fsr_meta_path}")
+
+    # 保存 Best Tail Checkpoint
+    if args.enable_best_checkpoint and best_tail_state is not None:
+        best_tail_path = os.path.join(output_dir, "best_tail.pt")
+        torch.save(best_tail_state, best_tail_path)
+        print(f"Best tail model saved to: {best_tail_path}")
+        print(
+            f"  -> iter={best_tail_iter}, tail_score={best_tail_value:.4f}, "
+            f"fsr={best_tail_fsr:.4f}, return={best_tail_return:.2f}"
+        )
+
+        best_tail_meta_path = os.path.join(output_dir, "best_tail_meta.json")
+        with open(best_tail_meta_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "iter": best_tail_iter,
+                "tail_score": best_tail_value,
+                "energy_p95": best_tail_energy_p95,
+                "load_p95": best_tail_load_p95,
+                "feasible_success_rate": best_tail_fsr,
+                "avg_return": best_tail_return,
+                "window": args.best_window_tail,
+                "tail_percentile": args.tail_percentile,
+                "energy_budget": args.energy_budget,
+                "load_budget": args.load_budget,
+            }, f, indent=2, ensure_ascii=False)
+        print(f"Best tail metadata saved to: {best_tail_meta_path}")
 
 
 if __name__ == "__main__":

@@ -89,12 +89,29 @@ class MultiCriticPPOConfig:
     #   若为 None，则所有 λ_k 初始化为 0
     initial_lambdas: Optional[Dict[str, float]] = None
 
+    # risk_factor: 风险敏感成本 = mean + risk_factor * std
+    #   0.0 表示仅使用平均成本（保持旧行为）
+    #   >0 时增加成本波动对 λ 更新的影响
+    risk_factor: float = 0.0
+
     # cost_value_coef: cost value loss 在总 value loss 中的权重系数
     #   1.0 -> reward 和 cost 的 value loss 等权
     #   0.0 -> 完全忽略 cost value loss
     cost_value_coef: float = 1.0
 
     lambda_gap_mode: str = "absolute"
+
+    # ========== 新增：dual(λ) 更新模式 ==========
+    # dual_update_mode:
+    #   - standard: 旧行为（保持向后兼容）
+    #   - hysteresis: gap EMA + deadband + 滞回
+    #   - decorrelated: gap 相关性消耦
+    #   - both: decorrelated 后再 hysteresis
+    dual_update_mode: str = "standard"
+    dual_gap_ema_beta: float = 0.10
+    dual_deadband: float = 0.02
+    dual_lr_down_scale: float = 0.20
+    dual_corr_ema_beta: float = 0.05
 
     # ========== 对偶更新稳定化开关（默认关闭，保持旧行为） ==========
     # D1: gap 的 EMA 平滑（降噪）
@@ -193,6 +210,16 @@ class MultiCriticPPO:
 
         # EMA gap 状态（用于 D1 开关）
         self.ema_gaps: Dict[str, float] = {name: 0.0 for name in self.cost_names}
+
+        # Dual 更新的 gap EMA（用于 hysteresis/decorrelated）
+        self.dual_gap_ema: Dict[str, float] = {name: 0.0 for name in self.cost_names}
+
+        # 相关性估计的 EMA 状态（仅 energy-load 对）
+        self.dual_corr_state = {
+            "mean": {name: 0.0 for name in self.cost_names},
+            "var": {name: 0.0 for name in self.cost_names},
+            "cov": 0.0,
+        }
 
         # 迭代计数器（用于 D2 开关）
         self._iter_count: int = 0
@@ -518,80 +545,194 @@ class MultiCriticPPO:
         avg_costs: Dict[str, float] = {}
         gaps: Dict[str, float] = {}
         ratio_gaps: Dict[str, float] = {}
+        std_costs: Dict[str, float] = {}
+        risk_costs: Dict[str, float] = {}
+        risk_gaps: Dict[str, float] = {}
+        risk_ratio_gaps: Dict[str, float] = {}
 
         for name in self.cost_names:
             cost_values = np.array(buffer["costs"][name], dtype=np.float32)
             avg_costs[name] = float(cost_values.mean()) if len(cost_values) > 0 else 0.0
+            std_val = float(cost_values.std()) if len(cost_values) > 0 else 0.0
+            std_costs[name] = std_val
             budget = self.cfg.cost_budgets.get(name, 0.0)
             gaps[name] = avg_costs[name] - budget
             denom = budget if budget > 0 else 1.0
             ratio_gaps[name] = (avg_costs[name] / (denom + 1e-8)) - 1.0
 
+            risk_cost = avg_costs[name] + self.cfg.risk_factor * std_val
+            risk_costs[name] = risk_cost
+            risk_gaps[name] = risk_cost - budget
+            risk_ratio_gaps[name] = (risk_cost / (denom + 1e-8)) - 1.0
+
         # 更新迭代计数器
         self._iter_count += 1
 
         # λ 更新（仅当 update_lambdas=True 时）
+        # 兼容旧逻辑：dual_update_mode=standard 完全复用原路径
+        gap_used_for_update: Dict[str, float] = {name: 0.0 for name in self.cost_names}
+        gap_ema_for_log: Dict[str, float] = {name: risk_ratio_gaps.get(name, 0.0) for name in self.cost_names}
+        corr_gap_for_log = 0.0
+
         if self.cfg.update_lambdas:
             # D2: 检查是否到达更新频率
             should_update_lambda = (self._iter_count % self.cfg.lambda_update_freq == 0)
 
-            if should_update_lambda:
+            # 预备：选择用于 dual 更新的原始 gap（ratio 或 absolute）
+            gap_for_mode = risk_ratio_gaps if self.cfg.lambda_gap_mode == "ratio" else risk_gaps
+
+            # ====== dual 模式：hysteresis / decorrelated / both ======
+            if self.cfg.dual_update_mode != "standard":
+                # 1) gap EMA（若 beta<=0 则退化为原 gap）
+                beta_gap = self.cfg.dual_gap_ema_beta
+                dual_gbar: Dict[str, float] = {}
                 for name in self.cost_names:
-                    budget = self.cfg.cost_budgets.get(name, 0.0)
-                    raw_gap = avg_costs[name] - budget
-                    gap_for_update = (
-                        ratio_gaps[name]
-                        if self.cfg.lambda_gap_mode == "ratio"
-                        else raw_gap
-                    )
-                    # D1: EMA 平滑（lambda_gap_ema_beta > 0 时启用）
-                    if self.cfg.lambda_gap_ema_beta > 0:
-                        beta = self.cfg.lambda_gap_ema_beta
-                        self.ema_gaps[name] = (1 - beta) * self.ema_gaps[name] + beta * gap_for_update
-                        effective_gap = self.ema_gaps[name]
+                    if beta_gap > 0:
+                        self.dual_gap_ema[name] = (1 - beta_gap) * self.dual_gap_ema[name] + beta_gap * gap_for_mode[name]
+                        dual_gbar[name] = self.dual_gap_ema[name]
                     else:
-                        effective_gap = gap_for_update
+                        dual_gbar[name] = gap_for_mode[name]
+                    gap_ema_for_log[name] = dual_gbar[name]
 
-                    # D3/D7/D8: dead-zone（支持 per-cost、全局、非对称）
-                    # 基础 deadzone：优先 per-cost，回退到全局
-                    deadzone = self.cfg.lambda_deadzone
-                    if self.cfg.lambda_deadzones is not None:
-                        deadzone = self.cfg.lambda_deadzones.get(name, self.cfg.lambda_deadzone)
+                # 2) 相关性消耦（仅 energy-load 对）
+                corr_val = 0.0
+                if self.cfg.dual_update_mode in ("decorrelated", "both") and {"energy", "load"}.issubset(set(self.cost_names)):
+                    b = self.cfg.dual_corr_ema_beta
+                    gE = dual_gbar["energy"]
+                    gL = dual_gbar["load"]
 
-                    # D8: 非对称 deadzone（覆盖基础 deadzone）
-                    # gap > 0 时使用 lambda_deadzone_up，gap < 0 时使用 lambda_deadzone_down
-                    if effective_gap > 0 and self.cfg.lambda_deadzone_up is not None:
-                        deadzone = self.cfg.lambda_deadzone_up
-                    elif effective_gap < 0 and self.cfg.lambda_deadzone_down is not None:
-                        deadzone = self.cfg.lambda_deadzone_down
+                    meanE = (1 - b) * self.dual_corr_state["mean"]["energy"] + b * gE
+                    meanL = (1 - b) * self.dual_corr_state["mean"]["load"] + b * gL
+                    varE = (1 - b) * self.dual_corr_state["var"]["energy"] + b * (gE - meanE) ** 2
+                    varL = (1 - b) * self.dual_corr_state["var"]["load"] + b * (gL - meanL) ** 2
+                    covEL = (1 - b) * self.dual_corr_state["cov"] + b * (gE - meanE) * (gL - meanL)
 
-                    if deadzone > 0 and abs(effective_gap) < deadzone:
-                        effective_gap = 0.0
+                    # 保存状态
+                    self.dual_corr_state["mean"]["energy"] = meanE
+                    self.dual_corr_state["mean"]["load"] = meanL
+                    self.dual_corr_state["var"]["energy"] = varE
+                    self.dual_corr_state["var"]["load"] = varL
+                    self.dual_corr_state["cov"] = covEL
 
-                    # 获取该 cost 的 lr：优先 lambda_lrs[name]，回退到 lambda_lr
-                    if self.cfg.lambda_lrs is not None:
-                        base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                    denom = varE * varL
+                    if denom < 1e-8:
+                        corr_val = 0.0
                     else:
-                        base_lr = self.cfg.lambda_lr
+                        corr_val = float(np.clip(covEL / np.sqrt(denom + 1e-8), -0.95, 0.95))
+                corr_gap_for_log = corr_val
 
-                    # D5-D6: 非对称学习率（Asymmetric LR）
-                    # gap > 0: 使用 lambda_lr_up（若设置）
-                    # gap < 0: 使用 lambda_lr_down（若设置）
-                    if effective_gap > 0 and self.cfg.lambda_lr_up is not None:
-                        lr = self.cfg.lambda_lr_up
-                    elif effective_gap < 0 and self.cfg.lambda_lr_down is not None:
-                        lr = self.cfg.lambda_lr_down
-                    else:
-                        lr = base_lr
+                # decorrelate（若需要）
+                dual_source = dual_gbar
+                if self.cfg.dual_update_mode in ("decorrelated", "both") and {"energy", "load"}.issubset(set(self.cost_names)):
+                    gtilde_energy = dual_gbar["energy"] - corr_val * dual_gbar["load"]
+                    gtilde_load = dual_gbar["load"] - corr_val * dual_gbar["energy"]
+                    dual_source = dual_gbar.copy()
+                    dual_source["energy"] = gtilde_energy
+                    dual_source["load"] = gtilde_load
 
-                    # λ_k ← max(0, λ_k + lr * effective_gap)
-                    new_lambda = max(0.0, self.lambdas[name] + lr * effective_gap)
+                # hysteresis 更新（hysteresis 或 both）
+                if should_update_lambda:
+                    for name in self.cost_names:
+                        # 获取基础 lr（保持与旧逻辑一致的优先级）
+                        if self.cfg.lambda_lrs is not None:
+                            base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                        else:
+                            base_lr = self.cfg.lambda_lr
 
-                    # D4: lambda_max clamp（若设置）
-                    if self.cfg.lambda_max is not None:
-                        new_lambda = min(new_lambda, self.cfg.lambda_max)
+                        # hysteresis 分支
+                        if self.cfg.dual_update_mode in ("hysteresis", "both"):
+                            g_val = dual_source.get(name, dual_gbar[name])
+                            if abs(g_val) <= self.cfg.dual_deadband:
+                                gap_used_for_update[name] = 0.0
+                                continue
 
-                    self.lambdas[name] = new_lambda
+                            lr_up = self.cfg.lambda_lr_up if self.cfg.lambda_lr_up is not None else base_lr
+                            step_lr = lr_up if g_val > 0 else lr_up * self.cfg.dual_lr_down_scale
+                            new_lambda = max(0.0, self.lambdas[name] + step_lr * g_val)
+                            gap_used_for_update[name] = g_val
+                        else:
+                            # decorrelated-only 分支
+                            g_val = dual_source.get(name, dual_gbar[name])
+                            lr = base_lr
+                            new_lambda = max(0.0, self.lambdas[name] + lr * g_val)
+                            gap_used_for_update[name] = g_val
+
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+                        self.lambdas[name] = new_lambda
+                else:
+                    # 未到更新频率，日志仍保留 gbar 与 corr
+                    gap_used_for_update.update({name: 0.0 for name in self.cost_names})
+
+            # ====== standard 模式（原逻辑保持不变） ======
+            else:
+                if should_update_lambda:
+                    for name in self.cost_names:
+                        budget = self.cfg.cost_budgets.get(name, 0.0)
+                        raw_gap = avg_costs[name] - budget
+                        gap_for_update = (
+                            ratio_gaps[name]
+                            if self.cfg.lambda_gap_mode == "ratio"
+                            else raw_gap
+                        )
+                        # D1: EMA 平滑（lambda_gap_ema_beta > 0 时启用）
+                        if self.cfg.lambda_gap_ema_beta > 0:
+                            beta = self.cfg.lambda_gap_ema_beta
+                            self.ema_gaps[name] = (1 - beta) * self.ema_gaps[name] + beta * gap_for_update
+                            effective_gap = self.ema_gaps[name]
+                        else:
+                            effective_gap = gap_for_update
+
+                        gap_ema_for_log[name] = effective_gap
+
+                        # D3/D7/D8: dead-zone（支持 per-cost、全局、非对称）
+                        # 基础 deadzone：优先 per-cost，回退到全局
+                        deadzone = self.cfg.lambda_deadzone
+                        if self.cfg.lambda_deadzones is not None:
+                            deadzone = self.cfg.lambda_deadzones.get(name, self.cfg.lambda_deadzone)
+
+                        # D8: 非对称 deadzone（覆盖基础 deadzone）
+                        # gap > 0 时使用 lambda_deadzone_up，gap < 0 时使用 lambda_deadzone_down
+                        if effective_gap > 0 and self.cfg.lambda_deadzone_up is not None:
+                            deadzone = self.cfg.lambda_deadzone_up
+                        elif effective_gap < 0 and self.cfg.lambda_deadzone_down is not None:
+                            deadzone = self.cfg.lambda_deadzone_down
+
+                        if deadzone > 0 and abs(effective_gap) < deadzone:
+                            effective_gap = 0.0
+
+                        # 获取该 cost 的 lr：优先 lambda_lrs[name]，回退到 lambda_lr
+                        if self.cfg.lambda_lrs is not None:
+                            base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                        else:
+                            base_lr = self.cfg.lambda_lr
+
+                        # D5-D6: 非对称学习率（Asymmetric LR）
+                        # gap > 0: 使用 lambda_lr_up（若设置）
+                        # gap < 0: 使用 lambda_lr_down（若设置）
+                        if effective_gap > 0 and self.cfg.lambda_lr_up is not None:
+                            lr = self.cfg.lambda_lr_up
+                        elif effective_gap < 0 and self.cfg.lambda_lr_down is not None:
+                            lr = self.cfg.lambda_lr_down
+                        else:
+                            lr = base_lr
+
+                        # λ_k ← max(0, λ_k + lr * effective_gap)
+                        new_lambda = max(0.0, self.lambdas[name] + lr * effective_gap)
+
+                        # D4: lambda_max clamp（若设置）
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+
+                        self.lambdas[name] = new_lambda
+                        gap_used_for_update[name] = effective_gap
+                else:
+                    # 未到更新频率：记录 EMA 或原 gap 用于日志
+                    for name in self.cost_names:
+                        gap_ema_for_log[name] = (
+                            self.ema_gaps[name] if self.cfg.lambda_gap_ema_beta > 0 else gap_for_mode[name]
+                        )
+                        gap_used_for_update[name] = 0.0
 
         # ========== 6. 构造返回的 metrics ==========
         denom = max(update_steps, 1)
@@ -608,10 +749,27 @@ class MultiCriticPPO:
             metrics[f"lambda_{name}"] = self.lambdas[name]
             metrics[f"gap_{name}"] = gaps[name]
             metrics[f"gap_ratio_{name}"] = ratio_gaps[name]
+            metrics[f"std_cost_{name}"] = std_costs[name]
+            metrics[f"risk_cost_{name}"] = risk_costs[name]
+            metrics[f"risk_gap_{name}"] = risk_gaps[name]
+            metrics[f"risk_gap_ratio_{name}"] = risk_ratio_gaps[name]
             # KKT 残差 = 更新后的 λ × 原始 gap（用于监控互补松弛条件）
             metrics[f"kkt_{name}"] = self.lambdas[name] * gaps[name]
+            metrics[f"risk_kkt_{name}"] = self.lambdas[name] * risk_gaps[name]
             if self.cfg.lambda_gap_ema_beta > 0:
                 metrics[f"ema_gap_{name}"] = self.ema_gaps[name]
+
+        # Dual 更新相关的诊断（统一记录 ratio gap 及实际使用的 gap）
+        if {"energy", "load"}.issubset(set(self.cost_names)):
+            metrics["gap_energy_raw"] = ratio_gaps.get("energy", 0.0)
+            metrics["gap_load_raw"] = ratio_gaps.get("load", 0.0)
+            metrics["gap_energy_ema"] = gap_ema_for_log.get("energy", ratio_gaps.get("energy", 0.0))
+            metrics["gap_load_ema"] = gap_ema_for_log.get("load", ratio_gaps.get("load", 0.0))
+            metrics["gap_energy_used"] = gap_used_for_update.get("energy", 0.0)
+            metrics["gap_load_used"] = gap_used_for_update.get("load", 0.0)
+            metrics["corr_gap_ema"] = corr_gap_for_log
+            metrics["risk_gap_energy_raw"] = risk_ratio_gaps.get("energy", 0.0)
+            metrics["risk_gap_load_raw"] = risk_ratio_gaps.get("load", 0.0)
 
         metrics["lambda_gap_mode"] = self.cfg.lambda_gap_mode
         

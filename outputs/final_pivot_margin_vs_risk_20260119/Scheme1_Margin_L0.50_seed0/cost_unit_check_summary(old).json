@@ -1,0 +1,61 @@
+{
+  "load_cost_scale": 5.0,
+  "energy_budget": 1.35,
+  "load_budget": 0.5,
+  "load_scaled_ratio": 1.0,
+  "load_raw_ratio": 0.0,
+  "load_mismatch_ratio": 0.0,
+  "energy_match_ratio": 1.0,
+  "energy_zero_on_invalid_ratio": 0.0,
+  "energy_mismatch_ratio": 0.0,
+  "LOAD_COST_COMPONENT_INCLUDES_SCALE": "YES",
+  "ENERGY_COST_COMPONENT_MATCHES_MAP": "YES",
+  "episodes": [
+    {
+      "ep": 0,
+      "load_scaled_ratio": 1.0,
+      "load_raw_ratio": 0.0,
+      "load_mismatch_ratio": 0.0,
+      "energy_match_ratio": 1.0,
+      "energy_zero_on_invalid_ratio": 0.0,
+      "energy_mismatch_ratio": 0.0
+    },
+    {
+      "ep": 1,
+      "load_scaled_ratio": 1.0,
+      "load_raw_ratio": 0.0,
+      "load_mismatch_ratio": 0.0,
+      "energy_match_ratio": 1.0,
+      "energy_zero_on_invalid_ratio": 0.0,
+      "energy_mismatch_ratio": 0.0
+    },
+    {
+      "ep": 2,
+      "load_scaled_ratio": 1.0,
+      "load_raw_ratio": 0.0,
+      "load_mismatch_ratio": 0.0,
+      "energy_match_ratio": 1.0,
+      "energy_zero_on_invalid_ratio": 0.0,
+      "energy_mismatch_ratio": 0.0
+    },
+    {
+      "ep": 3,
+      "load_scaled_ratio": 1.0,
+      "load_raw_ratio": 0.0,
+      "load_mismatch_ratio": 0.0,
+      "energy_match_ratio": 1.0,
+      "energy_zero_on_invalid_ratio": 0.0,
+      "energy_mismatch_ratio": 0.0
+    },
+    {
+      "ep": 4,
+      "load_scaled_ratio": 1.0,
+      "load_raw_ratio": 0.0,
+      "load_mismatch_ratio": 0.0,
+      "energy_match_ratio": 1.0,
+      "energy_zero_on_invalid_ratio": 0.0,
+      "energy_mismatch_ratio": 0.0
+    }
+  ],
+  "total_steps": 646
+}
