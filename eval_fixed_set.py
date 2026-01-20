@@ -15,6 +15,21 @@ from grid_hard_wrapper import GridHardWrapper
 from networks import MultiHeadActorCritic
 from grid_congestion_obs_wrapper import GridCongestionObsWrapper
 from grid_energy_obs_wrapper import GridEnergyObsWrapper
+from grid_obs_norm_wrapper import GridObsNormWrapper
+from grid_obs_norm_wrapper import GridObsNormWrapper
+
+
+def _get_action_mask(env):
+    """Safely retrieve action_mask from the first wrapper that provides get_action_mask()."""
+    cur = env
+    while cur is not None:
+        if hasattr(cur, "get_action_mask"):
+            try:
+                return cur.get_action_mask()
+            except Exception:
+                return None
+        cur = getattr(cur, "env", None)
+    return None
 
 def get_oracle_cost(env, weight_key='load'):
     """使用 Dijkstra 计算给定环境状态下的最优代价"""
@@ -79,6 +94,43 @@ def load_config_from_dir(ckpt_path: str) -> Dict:
         print(f"[WARNING] Config not found at {config_path}, using default values")
         return {}
 
+
+def inject_obs_stats(env, checkpoint, config: Dict):
+    need_norm = config.get("obs_rms", False)
+    stats = checkpoint.get("obs_stats")
+
+    target = None
+    cur = env
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, GridObsNormWrapper):
+            target = cur
+            break
+        cur = getattr(cur, "env", None)
+
+    if need_norm and target is None:
+        raise RuntimeError("❌ Config开启 obs_rms，但环境中未找到 GridObsNormWrapper")
+    if stats is not None and target is None:
+        raise RuntimeError("❌ Checkpoint 含 obs_stats，但环境未挂载 GridObsNormWrapper")
+    if need_norm and stats is None:
+        raise RuntimeError("❌ Config开启 obs_rms，但 checkpoint 中缺少 obs_stats")
+
+    if target is not None and stats is not None:
+        current_dim = env.observation_space.shape[0]
+        stats_dim = stats.mean.shape[0]
+        if current_dim != stats_dim:
+            raise RuntimeError(
+                f"❌ Obs Dimension Mismatch! Env: {current_dim}, Checkpoint: {stats_dim}. 请检查 Config 是否与模型匹配！"
+            )
+        target.obs_rms = stats
+        target.eval()
+        if hasattr(target, "training"):
+            target.training = False
+        if hasattr(target, "norm_reward"):
+            target.norm_reward = False
+        print("✅ Obs Stats injected & Frozen (Eval Mode).")
+
 def evaluate_fixed_set(
     model_path: str,
     num_episodes: int = 100,
@@ -117,6 +169,7 @@ def evaluate_fixed_set(
     include_energy_obs = config.get('include_energy_obs', True)
     energy_patch_radius = config.get('energy_patch_radius', patch_radius)
     energy_obs_normalize = config.get('energy_obs_normalize', True)
+    obs_rms = config.get('obs_rms', False)
     
     print("\n========== Evaluation Environment Config ==========")
     print(f"Grid Size: {grid_size}, Max Steps: {max_steps}")
@@ -150,6 +203,8 @@ def evaluate_fixed_set(
             env = GridCongestionObsWrapper(env, patch_radius=congestion_patch_radius)
         if include_energy_obs:
             env = GridEnergyObsWrapper(env, patch_radius=energy_patch_radius, normalize=energy_obs_normalize)
+        if obs_rms:
+            env = GridObsNormWrapper(env)
         env.reset(seed=seed)
         return env
 
@@ -157,22 +212,31 @@ def evaluate_fixed_set(
     temp_env = make_env(0)
     obs_sample, _ = temp_env.reset(seed=0)
     obs_dim = obs_sample.shape[0] if hasattr(obs_sample, 'shape') else len(obs_sample)
+    act_dim = temp_env.action_space.n
     temp_env.close()
     
     # 🔧 检测网络类型：从 checkpoint 中判断是 Multi-Head 还是 Scalar
     checkpoint = torch.load(model_path, map_location=device)
-    state_dict = checkpoint["network_state_dict"]
+    state_dict = checkpoint.get("network_state_dict", checkpoint.get("model_state_dict", checkpoint))
     
-    # 判断依据：Multi-Head 有 "cost_value_heads" 或 "cost_critics"，Scalar 没有
-    is_multi_head = any("cost_value_heads" in key or "cost_critics" in key for key in state_dict.keys())
+    # 判断依据：Multi-Head 有 v_cost_heads / actor_backbone / reward_backbone 等前缀
+    is_multi_head = any(
+        ("v_cost_heads" in key)
+        or ("cost_value_heads" in key)
+        or ("cost_critics" in key)
+        or ("actor_backbone" in key)
+        or ("reward_backbone" in key)
+        or ("cost_backbone" in key)
+        for key in state_dict.keys()
+    )
     
     if is_multi_head:
         print("[INFO] Detected Multi-Head network (Lagrangian PPO)")
         from networks import MultiHeadActorCritic
         agent = MultiHeadActorCritic(
             obs_dim=obs_dim,
-            act_dim=4,
-            hidden_dim=128,
+            act_dim=act_dim,
+            hidden_dim=config.get('hidden_dim', 128),
             cost_names=["energy", "load"]
         ).to(device)
     else:
@@ -180,8 +244,8 @@ def evaluate_fixed_set(
         from networks import ActorCritic
         agent = ActorCritic(
             obs_dim=obs_dim,
-            act_dim=4,
-            hidden_dim=128
+            act_dim=act_dim,
+            hidden_dim=config.get('hidden_dim', 128)
         ).to(device)
     
     agent.load_state_dict(state_dict)
@@ -194,6 +258,7 @@ def evaluate_fixed_set(
     for i in tqdm(range(num_episodes)):
         seed = seed_start + i
         env = make_env(seed)
+        inject_obs_stats(env, checkpoint, config)
         obs, _ = env.reset(seed=seed)
         
         # Oracle 计算
@@ -212,8 +277,10 @@ def evaluate_fixed_set(
         while not done:
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-                mask = env.get_action_mask()
-                mask_t = torch.as_tensor(mask, dtype=torch.float32).unsqueeze(0).to(device)
+                mask = _get_action_mask(env)
+                mask_t = None
+                if mask is not None:
+                    mask_t = torch.as_tensor(mask, dtype=torch.float32).unsqueeze(0).to(device)
                 
                 # 🔧 根据网络类型调用不同的接口
                 if is_multi_head:
@@ -325,6 +392,11 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
+    cfg_for_log = load_config_from_dir(args.ckpt_path)
+    scale_for_log = cfg_for_log.get("load_cost_scale", 1.0)
+    print(f"[INFO] load_cost_scale from config: {scale_for_log} (will be passed into env)")
+    print("[INFO] Oracle cost uses load_cost_scale inside get_oracle_cost: YES")
     
     evaluate_fixed_set(
         model_path=args.ckpt_path,

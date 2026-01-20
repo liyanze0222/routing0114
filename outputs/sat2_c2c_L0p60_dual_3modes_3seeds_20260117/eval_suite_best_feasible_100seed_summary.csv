@@ -1,0 +1,10 @@
+run_dir,success_rate,feasible_success_rate,feasible_given_success,avg_return,avg_return_success,energy_p95,load_p95,best_feasible_iter
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_standard_E1.35_L0.60_seed0,0.9800,0.3600,0.3673,2.6000,7.8776,1.6667,1.1750,429
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_standard_E1.35_L0.60_seed2,1.0000,0.3600,0.3600,7.8800,7.8800,1.6690,1.1884,598
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_decorrelated_E1.35_L0.60_seed1,1.0000,0.3500,0.3500,7.9800,7.9800,1.6697,1.2124,553
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_standard_E1.35_L0.60_seed1,1.0000,0.3200,0.3200,7.9400,7.9400,1.7294,1.0422,523
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_decorrelated_E1.35_L0.60_seed0,1.0000,0.3100,0.3100,8.0000,8.0000,1.7724,1.3360,397
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_hysteresis_E1.35_L0.60_seed0,1.0000,0.3100,0.3100,8.0200,8.0200,1.7273,1.1843,532
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_hysteresis_E1.35_L0.60_seed1,1.0000,0.3100,0.3100,7.9800,7.9800,1.8333,1.3131,571
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_hysteresis_E1.35_L0.60_seed2,1.0000,0.2900,0.2900,8.0200,8.0200,1.7294,1.2270,660
+outputs/sat2_c2c_L0p60_dual_3modes_3seeds_20260117\C2C_V0_dual_decorrelated_E1.35_L0.60_seed2,1.0000,0.2400,0.2400,8.0200,8.0200,1.7294,1.3859,705
