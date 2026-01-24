@@ -59,6 +59,13 @@ class MultiCriticPPOConfig:
     max_grad_norm: float = 0.5
     target_kl: float = 0.015
 
+    # 诊断：是否记录 actor loss 分解日志（默认关闭以避免额外开销）
+    log_actor_decomp: bool = False
+
+    # 诊断：actor 梯度分解与 cosine（A2，默认关闭）
+    log_actor_grad_decomp: bool = False
+    grad_decomp_interval: int = 100
+
     # 优化器超参
     lr: float = 3e-4
     batch_size: int = 2048       # 每次采样的总步数
@@ -112,6 +119,10 @@ class MultiCriticPPOConfig:
     dual_deadband: float = 0.02
     dual_lr_down_scale: float = 0.20
     dual_corr_ema_beta: float = 0.05
+    dual_precond_eps: float = 0.05
+    dual_precond_clip: float = 2.0
+    dual_precond_strength: float = 0.3
+    dual_precond_use_ema_stats: bool = True
 
     # ========== 对偶更新稳定化开关（默认关闭，保持旧行为） ==========
     # D1: gap 的 EMA 平滑（降噪）
@@ -158,12 +169,20 @@ class MultiCriticPPOConfig:
     # cost_critic_mode: 控制 cost value head 的结构
     #   "separate"（默认）: 每个 cost 有独立的 value head
     #   "shared": 所有 cost 共享一个 value head（输出维度 = len(cost_names)）
+    #   "aggregated": two-critic (V_reward, V_cost_total)，不再有独立 cost heads
     cost_critic_mode: str = "separate"
 
     # value_head_mode: reward+cost value head 结构
     #   "standard"（默认）：reward 独立 head，cost 根据 cost_critic_mode
     #   "shared_all": 单头同时输出 reward+所有 cost（忽略 cost_critic_mode）
     value_head_mode: str = "standard"
+
+    # ========== Aggregated Cost 模式参数（仅 cost_critic_mode="aggregated" 时使用） ==========
+    # 权重：total_cost = wE * (energy_cost / energy_budget) + wL * (load_cost / load_budget)
+    agg_cost_w_energy: float = 1.0
+    agg_cost_w_load: float = 1.0
+    # 是否按预算归一化（True: 相对预算消耗; False: 直接加权和）
+    agg_cost_normalize_by_budget: bool = True
 
     device: str = "cpu"
 
@@ -185,6 +204,9 @@ class MultiCriticPPO:
 
         # cost 名称由 cost_budgets 的 key 决定
         self.cost_names: List[str] = list(config.cost_budgets.keys())
+        
+        # aggregated 模式标记
+        self.is_aggregated_mode = (config.cost_critic_mode == "aggregated")
 
         # 初始化网络
         self.network = MultiHeadActorCritic(
@@ -199,14 +221,24 @@ class MultiCriticPPO:
         self.optimizer = optim.Adam(self.network.parameters(), lr=config.lr)
 
         # 初始化拉格朗日乘子 λ
-        # 若 initial_lambdas 为 None，则全部初始化为 0
-        # 否则使用传入的值（缺失的 key 用 0 填充）
+        # aggregated 模式：仅使用 lambda_total（存储在 lambda_energy）
+        # separate 模式：每个 cost 独立的 λ
         self.lambdas: Dict[str, float] = {}
-        for name in self.cost_names:
+        if self.is_aggregated_mode:
+            # aggregated 模式：仅使用 "energy" key 存储 lambda_total
             if config.initial_lambdas is not None:
-                self.lambdas[name] = config.initial_lambdas.get(name, 0.0)
+                self.lambdas["energy"] = config.initial_lambdas.get("energy", 0.0)
             else:
-                self.lambdas[name] = 0.0
+                self.lambdas["energy"] = 0.0
+            # load lambda 设为 0（兼容性，不使用）
+            self.lambdas["load"] = 0.0
+        else:
+            # separate 模式：每个 cost 独立初始化
+            for name in self.cost_names:
+                if config.initial_lambdas is not None:
+                    self.lambdas[name] = config.initial_lambdas.get(name, 0.0)
+                else:
+                    self.lambdas[name] = 0.0
 
         # EMA gap 状态（用于 D1 开关）
         self.ema_gaps: Dict[str, float] = {name: 0.0 for name in self.cost_names}
@@ -231,21 +263,51 @@ class MultiCriticPPO:
         self.global_cumulative_costs = {name: 0.0 for name in self.cost_names}
         self.global_total_steps = 0
 
+        # [新增] Precond clip 统计：记录最近 N 次是否被 clip
+        self.precond_clip_history = {
+            "energy": [],
+            "load": [],
+        }
+        self.precond_clip_window = 200  # 统计窗口大小
+
+    def _policy_parameters(self) -> List[torch.nn.Parameter]:
+        """返回影响 policy logits 的参数集合（actor backbone + policy head）。
+
+        如果未来改为共享 backbone，请确保这里至少包含用于产生动作 logits 的参数。"""
+        return list(self.network.actor_backbone.parameters()) + list(self.network.policy_head.parameters())
+
     # ==================== Rollout Buffer ====================
 
     def _reset_buffer(self):
         """重置 rollout buffer。"""
-        self.rollout_buffer = {
-            "obs": [],
-            "actions": [],
-            "rewards": [],
-            "dones": [],
-            "log_probs": [],
-            "action_masks": [],
-            "v_rewards": [],
-            "v_costs": {name: [] for name in self.cost_names},
-            "costs": {name: [] for name in self.cost_names},
-        }
+        if self.is_aggregated_mode:
+            # aggregated 模式：使用 v_cost_total 和 cost_total
+            self.rollout_buffer = {
+                "obs": [],
+                "actions": [],
+                "rewards": [],
+                "dones": [],
+                "log_probs": [],
+                "action_masks": [],
+                "v_rewards": [],
+                "v_cost_total": [],
+                "cost_total": [],
+                # 保留原始 costs 用于日志记录
+                "costs": {name: [] for name in self.cost_names},
+            }
+        else:
+            # separate 模式：每个 cost 独立
+            self.rollout_buffer = {
+                "obs": [],
+                "actions": [],
+                "rewards": [],
+                "dones": [],
+                "log_probs": [],
+                "action_masks": [],
+                "v_rewards": [],
+                "v_costs": {name: [] for name in self.cost_names},
+                "costs": {name: [] for name in self.cost_names},
+            }
 
     def collect_rollout(
         self,
@@ -270,7 +332,7 @@ class MultiCriticPPO:
             log_prob: 动作的 log 概率
             action_mask: 动作掩码
             v_reward: reward value 估计
-            v_costs: 各 cost 的 value 估计
+            v_costs: 各 cost 的 value 估计（aggregated 模式下包含 "total" key）
             costs_dict: 来自环境的 info['cost_components']
         """
         self.rollout_buffer["obs"].append(np.array(obs, copy=True))
@@ -281,13 +343,40 @@ class MultiCriticPPO:
         self.rollout_buffer["action_masks"].append(np.array(action_mask, copy=True))
         self.rollout_buffer["v_rewards"].append(float(v_reward))
 
+        # 保留原始 costs 用于日志
         for name in self.cost_names:
-            self.rollout_buffer["v_costs"][name].append(
-                float(v_costs.get(name, 0.0))
-            )
             self.rollout_buffer["costs"][name].append(
                 float(costs_dict.get(name, 0.0))
             )
+
+        if self.is_aggregated_mode:
+            # aggregated 模式：计算并收集 total_cost
+            energy_cost = float(costs_dict.get("energy", 0.0))
+            load_cost = float(costs_dict.get("load", 0.0))
+            
+            if self.cfg.agg_cost_normalize_by_budget:
+                # 按预算归一化
+                energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
+                load_budget = self.cfg.cost_budgets.get("load", 1.0)
+                total_cost = (
+                    self.cfg.agg_cost_w_energy * (energy_cost / max(energy_budget, 1e-8)) +
+                    self.cfg.agg_cost_w_load * (load_cost / max(load_budget, 1e-8))
+                )
+            else:
+                # 直接加权和
+                total_cost = (
+                    self.cfg.agg_cost_w_energy * energy_cost +
+                    self.cfg.agg_cost_w_load * load_cost
+                )
+            
+            self.rollout_buffer["cost_total"].append(float(total_cost))
+            self.rollout_buffer["v_cost_total"].append(float(v_costs.get("total", 0.0)))
+        else:
+            # separate 模式：分别收集各 cost 的 value
+            for name in self.cost_names:
+                self.rollout_buffer["v_costs"][name].append(
+                    float(v_costs.get(name, 0.0))
+                )
 
     # ==================== 动作选择 ====================
 
@@ -414,33 +503,193 @@ class MultiCriticPPO:
             buffer["dones"],
         )
 
-        # ========== 2. 计算每个 cost 的 GAE ==========
-        adv_costs: Dict[str, np.ndarray] = {}
-        ret_costs: Dict[str, np.ndarray] = {}
-        for name in self.cost_names:
-            adv, ret = self._compute_gae(
-                buffer["costs"][name],
-                buffer["v_costs"][name],
+        # ========== 2. 根据模式计算 cost 的 GAE ==========
+        if self.is_aggregated_mode:
+            # aggregated 模式：计算 total_cost 的 GAE
+            adv_cost_total, ret_cost_total = self._compute_gae(
+                buffer["cost_total"],
+                buffer["v_cost_total"],
                 buffer["dones"],
             )
-            adv_costs[name] = adv
-            ret_costs[name] = ret
+            # 兼容性：设置空的 adv_costs 和 ret_costs
+            adv_costs: Dict[str, np.ndarray] = {}
+            ret_costs: Dict[str, np.ndarray] = {}
+        else:
+            # separate 模式：计算每个 cost 的 GAE
+            adv_costs: Dict[str, np.ndarray] = {}
+            ret_costs: Dict[str, np.ndarray] = {}
+            for name in self.cost_names:
+                adv, ret = self._compute_gae(
+                    buffer["costs"][name],
+                    buffer["v_costs"][name],
+                    buffer["dones"],
+                )
+                adv_costs[name] = adv
+                ret_costs[name] = ret
+
+        actor_params = self._policy_parameters()
+
+        def _flatten_params(params: List[torch.nn.Parameter]) -> torch.Tensor:
+            if not params:
+                return torch.tensor([], dtype=torch.float32)
+            return torch.cat([p.detach().cpu().reshape(-1) for p in params])
+
+        with torch.no_grad():
+            actor_param_before = _flatten_params(actor_params)
+            actor_param_norm_l2 = (
+                torch.linalg.norm(actor_param_before).item() if actor_param_before.numel() > 0 else 0.0
+            )
 
         # ========== 3. 构造有效优势 adv_eff ==========
-        # adv_eff = adv_reward - Σ λ_k * adv_cost_k
-        # 注：融合后再进行标准化，避免破坏 GAE 的相对尺度
-        adv_eff = adv_reward.copy()
-        for name in self.cost_names:
-            adv_eff -= self.lambdas[name] * adv_costs[name]
-        adv_eff = self._normalize_advantage(adv_eff)
+        if self.is_aggregated_mode:
+            # aggregated 模式：adv_eff = adv_reward - lambda_total * adv_cost_total
+            lambda_total = self.lambdas.get("energy", 0.0)  # 复用 "energy" key 存储 lambda_total
+            adv_eff_raw = adv_reward - lambda_total * adv_cost_total
+            adv_energy_raw = adv_cost_total
+            adv_load_raw = np.zeros_like(adv_reward, dtype=np.float32)
+        else:
+            # separate 模式：adv_eff = adv_reward - Σ λ_k * adv_cost_k
+            adv_eff_raw = adv_reward.copy()
+            for name in self.cost_names:
+                adv_eff_raw -= self.lambdas[name] * adv_costs[name]
+            adv_energy_raw = adv_costs.get("energy", np.zeros_like(adv_reward, dtype=np.float32))
+            adv_load_raw = adv_costs.get("load", np.zeros_like(adv_reward, dtype=np.float32))
+        
+        adv_eff = self._normalize_advantage(adv_eff_raw)
+
+        # Advantage diagnostics (use normalized advantages aligned with actor loss)
+        adv_penalty_metrics: Dict[str, float] = {}
+        lambdaA_metrics: Dict[str, float] = {}
+        with torch.no_grad():
+            adv_reward_norm = torch.as_tensor(
+                self._normalize_advantage(adv_reward), dtype=torch.float32, device=self.device
+            )
+            if self.is_aggregated_mode:
+                adv_cost_total_norm = torch.as_tensor(
+                    self._normalize_advantage(adv_cost_total), dtype=torch.float32, device=self.device
+                )
+                lambda_energy = self.lambdas.get("energy", 0.0)
+                adv_penalty = lambda_energy * adv_cost_total_norm
+                lambdaA_total = (lambda_energy * adv_cost_total_norm).abs().mean().item()
+                lambdaA_metrics = {
+                    "lambdaA_energy_abs_mean": 0.0,
+                    "lambdaA_load_abs_mean": 0.0,
+                    "lambdaA_total_abs_mean": lambdaA_total,
+                }
+            else:
+                adv_energy_norm = torch.as_tensor(
+                    self._normalize_advantage(adv_costs.get("energy", np.zeros_like(adv_reward))),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                adv_load_norm = torch.as_tensor(
+                    self._normalize_advantage(adv_costs.get("load", np.zeros_like(adv_reward))),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                lambda_energy = self.lambdas.get("energy", 0.0)
+                lambda_load = self.lambdas.get("load", 0.0)
+                adv_penalty = lambda_energy * adv_energy_norm + lambda_load * adv_load_norm
+
+                penalty_adv_energy = (lambda_energy * adv_energy_norm).abs().mean().item()
+                penalty_adv_load = (lambda_load * adv_load_norm).abs().mean().item()
+                lambdaA_metrics = {
+                    "lambdaA_energy_abs_mean": penalty_adv_energy,
+                    "lambdaA_load_abs_mean": penalty_adv_load,
+                    "lambdaA_total_abs_mean": (lambda_energy * adv_energy_norm + lambda_load * adv_load_norm).abs().mean().item(),
+                }
+
+            adv_reward_abs_mean = adv_reward_norm.abs().mean().item()
+            adv_penalty_abs_mean = adv_penalty.abs().mean().item()
+            adv_penalty_metrics = {
+                "adv_reward_abs_mean": adv_reward_abs_mean,
+                "adv_penalty_abs_mean": adv_penalty_abs_mean,
+                "adv_penalty_to_reward_ratio": adv_penalty_abs_mean / (adv_reward_abs_mean + 1e-8),
+                "adv_reward_mean": adv_reward_norm.mean().item(),
+                "adv_penalty_mean": adv_penalty.mean().item(),
+            }
+
+        # 梯度分解（A2）开关：默认关闭，仅当满足间隔时计算
+        actor_params = self._policy_parameters()
+        should_log_grad_decomp = (
+            bool(self.cfg.log_actor_grad_decomp)
+            and ((self._iter_count + 1) % max(1, int(self.cfg.grad_decomp_interval)) == 0)
+            and len(actor_params) > 0
+        )
+        grad_decomp_metrics: Dict[str, float] = {}
+
+        def _flatten_grad_list(grads: List[Optional[torch.Tensor]]) -> torch.Tensor:
+            flat_parts: List[torch.Tensor] = []
+            for grad, param in zip(grads, actor_params):
+                if grad is None:
+                    flat_parts.append(torch.zeros_like(param).reshape(-1))
+                else:
+                    flat_parts.append(grad.reshape(-1))
+            if not flat_parts:
+                return torch.tensor(0.0, device=self.device)
+            return torch.cat(flat_parts)
+
+        actor_decomp_enabled = bool(self.cfg.log_actor_decomp)
+        actor_decomp_tensors: Dict[str, torch.Tensor] = {}
+        actor_decomp_stats: Dict[str, float] = {}
+        total_pg_r_like = 0.0
+        total_pg_p_like = 0.0
+        decomp_update_steps = 0
+
+        if actor_decomp_enabled:
+            eps = 1e-8
+            adv_eff_mean = float(np.mean(adv_eff_raw))
+            adv_eff_std = float(np.std(adv_eff_raw) + eps)
+
+            # 将 reward/cost 优势投影到与 actor loss 一致的归一化尺度
+            adv_r_like = (adv_reward - adv_eff_mean) / adv_eff_std
+            adv_energy_like = adv_energy_raw / adv_eff_std
+            adv_load_like = adv_load_raw / adv_eff_std
+
+            lambda_energy = self.lambdas.get("energy", 0.0)
+            lambda_load = self.lambdas.get("load", 0.0)
+            penalty_like = lambda_energy * adv_energy_like + lambda_load * adv_load_like
+
+            adv_r_t = torch.as_tensor(adv_r_like, dtype=torch.float32, device=self.device)
+            adv_energy_t = torch.as_tensor(adv_energy_like, dtype=torch.float32, device=self.device)
+            adv_load_t = torch.as_tensor(adv_load_like, dtype=torch.float32, device=self.device)
+            penalty_t = torch.as_tensor(penalty_like, dtype=torch.float32, device=self.device)
+
+            actor_decomp_tensors = {
+                "adv_r": adv_r_t,
+                "adv_energy": adv_energy_t,
+                "adv_load": adv_load_t,
+                "penalty": penalty_t,
+            }
+
+            with torch.no_grad():
+                actor_decomp_stats = {
+                    "adv_r_mean": adv_r_t.mean().item(),
+                    "adv_r_std": adv_r_t.std().item(),
+                    "adv_energy_mean": adv_energy_t.mean().item(),
+                    "adv_energy_std": adv_energy_t.std().item(),
+                    "adv_load_mean": adv_load_t.mean().item(),
+                    "adv_load_std": adv_load_t.std().item(),
+                    "lambda_energy": lambda_energy,
+                    "lambda_load": lambda_load,
+                    "penalty_mean": penalty_t.mean().item(),
+                    "penalty_abs_mean": penalty_t.abs().mean().item(),
+                    "adv_eff_mean": float(np.mean(adv_eff)),
+                    "adv_eff_std": float(np.std(adv_eff)),
+                }
 
         # 转换为 tensor
         adv_eff_t = torch.as_tensor(adv_eff, dtype=torch.float32, device=self.device)
         ret_reward_t = torch.as_tensor(ret_reward, dtype=torch.float32, device=self.device)
-        ret_costs_t = {
-            name: torch.as_tensor(arr, dtype=torch.float32, device=self.device)
-            for name, arr in ret_costs.items()
-        }
+        
+        if self.is_aggregated_mode:
+            ret_cost_total_t = torch.as_tensor(ret_cost_total, dtype=torch.float32, device=self.device)
+            ret_costs_t = {}
+        else:
+            ret_costs_t = {
+                name: torch.as_tensor(arr, dtype=torch.float32, device=self.device)
+                for name, arr in ret_costs.items()
+            }
 
         # ========== 4. PPO 更新循环 ==========
         batch_size = obs.shape[0]
@@ -473,7 +722,13 @@ class MultiCriticPPO:
                 mb_action_masks = action_masks[mb_idx]
                 mb_adv_eff = adv_eff_t[mb_idx]
                 mb_ret_reward = ret_reward_t[mb_idx]
-                mb_ret_costs = {name: ret_costs_t[name][mb_idx] for name in self.cost_names}
+                
+                # aggregated 模式：使用 ret_cost_total_t；separate 模式：使用 ret_costs_t
+                if self.is_aggregated_mode:
+                    mb_ret_cost_total = ret_cost_total_t[mb_idx]
+                    mb_ret_costs = {}
+                else:
+                    mb_ret_costs = {name: ret_costs_t[name][mb_idx] for name in self.cost_names}
 
                 # 前向传播
                 new_log_probs, entropy, v_reward, v_costs = self.network.evaluate_actions(
@@ -492,27 +747,101 @@ class MultiCriticPPO:
 
                 # ===== Policy Loss (PPO-Clip) =====
                 ratio = torch.exp(new_log_probs - mb_old_log_probs)
-                surr1 = ratio * mb_adv_eff
-                surr2 = torch.clamp(
+                ratio_clipped = torch.clamp(
                     ratio, 1.0 - self.cfg.clip_coef, 1.0 + self.cfg.clip_coef
-                ) * mb_adv_eff
+                )
+
+                # 梯度分解与 cosine（A2）：仅在开启且满足间隔时计算一次
+                if should_log_grad_decomp and not grad_decomp_metrics:
+                    mb_adv_r = adv_reward_norm[mb_idx]
+                    if self.is_aggregated_mode:
+                        mb_adv_energy = adv_cost_total_norm[mb_idx]
+                        mb_adv_load = torch.zeros_like(mb_adv_energy)
+                    else:
+                        mb_adv_energy = adv_energy_norm[mb_idx]
+                        mb_adv_load = adv_load_norm[mb_idx]
+
+                    lambda_energy_cur = self.lambdas.get("energy", 0.0)
+                    lambda_load_cur = self.lambdas.get("load", 0.0)
+                    penalty_mb = lambda_energy_cur * mb_adv_energy + lambda_load_cur * mb_adv_load
+
+                    loss_r = -torch.min(ratio * mb_adv_r, ratio_clipped * mb_adv_r).mean()
+                    loss_c = torch.min(ratio * penalty_mb, ratio_clipped * penalty_mb).mean()
+                    loss_total = loss_r + loss_c
+
+                    grads_r = torch.autograd.grad(
+                        loss_r, actor_params, retain_graph=True, allow_unused=True
+                    )
+                    grads_c = torch.autograd.grad(
+                        loss_c, actor_params, retain_graph=True, allow_unused=True
+                    )
+                    grads_t = torch.autograd.grad(
+                        loss_total, actor_params, retain_graph=True, allow_unused=True
+                    )
+
+                    g_r_flat = _flatten_grad_list(grads_r)
+                    g_c_flat = _flatten_grad_list(grads_c)
+                    g_t_flat = _flatten_grad_list(grads_t)
+
+                    g_r_norm = torch.linalg.norm(g_r_flat).item()
+                    g_c_norm = torch.linalg.norm(g_c_flat).item()
+                    g_t_norm = torch.linalg.norm(g_t_flat).item()
+
+                    cos_total_r = 0.0
+                    cos_total_c = 0.0
+                    if g_r_norm > 0 and g_t_norm > 0:
+                        cos_total_r = float(torch.dot(g_t_flat, g_r_flat).item() / (g_t_norm * g_r_norm + 1e-12))
+                    if g_c_norm > 0 and g_t_norm > 0:
+                        cos_total_c = float(torch.dot(g_t_flat, g_c_flat).item() / (g_t_norm * g_c_norm + 1e-12))
+
+                    grad_decomp_metrics = {
+                        "g_r_norm": g_r_norm,
+                        "g_c_norm": g_c_norm,
+                        "g_t_norm": g_t_norm,
+                        "g_c_over_r": g_c_norm / (g_r_norm + 1e-12),
+                        "cos_total_r": cos_total_r,
+                        "cos_total_c": cos_total_c,
+                    }
+
+                surr1 = ratio * mb_adv_eff
+                surr2 = ratio_clipped * mb_adv_eff
                 policy_loss = -torch.min(surr1, surr2).mean()
+
+                if actor_decomp_enabled:
+                    with torch.no_grad():
+                        mb_adv_r = actor_decomp_tensors["adv_r"][mb_idx]
+                        mb_penalty = actor_decomp_tensors["penalty"][mb_idx]
+                        pg_loss_r_like = -torch.min(ratio * mb_adv_r, ratio_clipped * mb_adv_r).mean()
+                        pg_loss_p_like = torch.min(ratio * mb_penalty, ratio_clipped * mb_penalty).mean()
+                        total_pg_r_like += pg_loss_r_like.item()
+                        total_pg_p_like += pg_loss_p_like.item()
+                        decomp_update_steps += 1
 
                 # ===== Value Loss =====
                 # reward value loss
                 value_loss_reward = 0.5 * F.mse_loss(v_reward, mb_ret_reward)
 
                 # cost value losses
-                value_loss_costs = []
-                for name in self.cost_names:
-                    loss_cost = 0.5 * F.mse_loss(v_costs[name], mb_ret_costs[name])
-                    value_loss_costs.append(loss_cost)
-
-                # 总 value loss = reward_loss + cost_value_coef * Σ cost_losses
-                if self.cfg.cost_value_coef > 0.0 and len(value_loss_costs) > 0:
-                    value_loss = value_loss_reward + self.cfg.cost_value_coef * sum(value_loss_costs)
+                if self.is_aggregated_mode:
+                    # aggregated 模式：仅计算 v_cost_total 的 loss
+                    mb_ret_cost_total = ret_cost_total_t[mb_idx]
+                    value_loss_cost_total = 0.5 * F.mse_loss(v_costs["total"], mb_ret_cost_total)
+                    if self.cfg.cost_value_coef > 0.0:
+                        value_loss = value_loss_reward + self.cfg.cost_value_coef * value_loss_cost_total
+                    else:
+                        value_loss = value_loss_reward
                 else:
-                    value_loss = value_loss_reward
+                    # separate 模式：计算每个 cost 的 value loss
+                    value_loss_costs = []
+                    for name in self.cost_names:
+                        loss_cost = 0.5 * F.mse_loss(v_costs[name], mb_ret_costs[name])
+                        value_loss_costs.append(loss_cost)
+
+                    # 总 value loss = reward_loss + cost_value_coef * Σ cost_losses
+                    if self.cfg.cost_value_coef > 0.0 and len(value_loss_costs) > 0:
+                        value_loss = value_loss_reward + self.cfg.cost_value_coef * sum(value_loss_costs)
+                    else:
+                        value_loss = value_loss_reward
 
                 # ===== 总损失 =====
                 loss = (
@@ -541,6 +870,14 @@ class MultiCriticPPO:
             if not continue_training:
                 break
 
+        with torch.no_grad():
+            actor_param_after = _flatten_params(actor_params)
+            delta_vec = actor_param_after - actor_param_before
+            actor_param_delta_l2 = (
+                torch.linalg.norm(delta_vec).item() if delta_vec.numel() > 0 else 0.0
+            )
+        actor_param_delta_ratio = actor_param_delta_l2 / (actor_param_norm_l2 + 1e-8)
+
         # ========== 5. 计算 avg_cost、gap 并更新 λ ==========
         avg_costs: Dict[str, float] = {}
         gaps: Dict[str, float] = {}
@@ -550,36 +887,127 @@ class MultiCriticPPO:
         risk_gaps: Dict[str, float] = {}
         risk_ratio_gaps: Dict[str, float] = {}
 
-        for name in self.cost_names:
-            cost_values = np.array(buffer["costs"][name], dtype=np.float32)
-            avg_costs[name] = float(cost_values.mean()) if len(cost_values) > 0 else 0.0
-            std_val = float(cost_values.std()) if len(cost_values) > 0 else 0.0
-            std_costs[name] = std_val
-            budget = self.cfg.cost_budgets.get(name, 0.0)
-            gaps[name] = avg_costs[name] - budget
-            denom = budget if budget > 0 else 1.0
-            ratio_gaps[name] = (avg_costs[name] / (denom + 1e-8)) - 1.0
+        if self.is_aggregated_mode:
+            # aggregated 模式：计算 total_cost 的统计信息
+            total_cost_values = np.array(buffer["cost_total"], dtype=np.float32)
+            avg_cost_total = float(total_cost_values.mean()) if len(total_cost_values) > 0 else 0.0
+            std_cost_total = float(total_cost_values.std()) if len(total_cost_values) > 0 else 0.0
+            
+            # 预算归一化后的目标是 1.0（或者是加权和的 budget）
+            if self.cfg.agg_cost_normalize_by_budget:
+                total_budget = 1.0  # 归一化后的目标
+            else:
+                energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
+                load_budget = self.cfg.cost_budgets.get("load", 1.0)
+                total_budget = self.cfg.agg_cost_w_energy * energy_budget + self.cfg.agg_cost_w_load * load_budget
+            
+            gap_total = avg_cost_total - total_budget
+            ratio_gap_total = (avg_cost_total / max(total_budget, 1e-8)) - 1.0
+            
+            risk_cost_total = avg_cost_total + self.cfg.risk_factor * std_cost_total
+            risk_gap_total = risk_cost_total - total_budget
+            risk_ratio_gap_total = (risk_cost_total / max(total_budget, 1e-8)) - 1.0
+            
+            # 仍然计算原始 cost 的统计（用于日志）
+            for name in self.cost_names:
+                cost_values = np.array(buffer["costs"][name], dtype=np.float32)
+                avg_costs[name] = float(cost_values.mean()) if len(cost_values) > 0 else 0.0
+                std_val = float(cost_values.std()) if len(cost_values) > 0 else 0.0
+                std_costs[name] = std_val
+                budget = self.cfg.cost_budgets.get(name, 0.0)
+                gaps[name] = avg_costs[name] - budget
+                denom = budget if budget > 0 else 1.0
+                ratio_gaps[name] = (avg_costs[name] / (denom + 1e-8)) - 1.0
+                risk_costs[name] = avg_costs[name] + self.cfg.risk_factor * std_val
+                risk_gaps[name] = risk_costs[name] - budget
+                risk_ratio_gaps[name] = (risk_costs[name] / (denom + 1e-8)) - 1.0
+        else:
+            # separate 模式：计算每个 cost 的统计
+            for name in self.cost_names:
+                cost_values = np.array(buffer["costs"][name], dtype=np.float32)
+                avg_costs[name] = float(cost_values.mean()) if len(cost_values) > 0 else 0.0
+                std_val = float(cost_values.std()) if len(cost_values) > 0 else 0.0
+                std_costs[name] = std_val
+                budget = self.cfg.cost_budgets.get(name, 0.0)
+                gaps[name] = avg_costs[name] - budget
+                denom = budget if budget > 0 else 1.0
+                ratio_gaps[name] = (avg_costs[name] / (denom + 1e-8)) - 1.0
 
-            risk_cost = avg_costs[name] + self.cfg.risk_factor * std_val
-            risk_costs[name] = risk_cost
-            risk_gaps[name] = risk_cost - budget
-            risk_ratio_gaps[name] = (risk_cost / (denom + 1e-8)) - 1.0
+                risk_cost = avg_costs[name] + self.cfg.risk_factor * std_val
+                risk_costs[name] = risk_cost
+                risk_gaps[name] = risk_cost - budget
+                risk_ratio_gaps[name] = (risk_cost / (denom + 1e-8)) - 1.0
 
         # 更新迭代计数器
         self._iter_count += 1
 
         # λ 更新（仅当 update_lambdas=True 时）
-        # 兼容旧逻辑：dual_update_mode=standard 完全复用原路径
+        # aggregated 模式：仅更新 lambda_total（存储在 lambda["energy"]）
+        # separate 模式：更新每个 cost 的 lambda
         gap_used_for_update: Dict[str, float] = {name: 0.0 for name in self.cost_names}
-        gap_ema_for_log: Dict[str, float] = {name: risk_ratio_gaps.get(name, 0.0) for name in self.cost_names}
+        gap_ema_for_log: Dict[str, float] = {}
+        
+        if self.is_aggregated_mode:
+            gap_ema_for_log["total"] = risk_ratio_gap_total if self.cfg.lambda_gap_mode == "ratio" else risk_gap_total
+        else:
+            gap_ema_for_log = {name: risk_ratio_gaps.get(name, 0.0) for name in self.cost_names}
+        
         corr_gap_for_log = 0.0
+        precond_diag: Dict[str, float] = {}
 
         if self.cfg.update_lambdas:
             # D2: 检查是否到达更新频率
             should_update_lambda = (self._iter_count % self.cfg.lambda_update_freq == 0)
 
-            # 预备：选择用于 dual 更新的原始 gap（ratio 或 absolute）
-            gap_for_mode = risk_ratio_gaps if self.cfg.lambda_gap_mode == "ratio" else risk_gaps
+            if self.is_aggregated_mode:
+                # ========== aggregated 模式的 dual update ==========
+                # 仅更新 lambda_total（存储在 lambda["energy"]）
+                gap_for_update = risk_ratio_gap_total if self.cfg.lambda_gap_mode == "ratio" else risk_gap_total
+                
+                if should_update_lambda:
+                    # 使用 standard 模式（简化版，不使用 decorrelated/precond）
+                    # 获取 lambda_lr（优先使用 lambda_lr_energy，否则使用 lambda_lr）
+                    if self.cfg.lambda_lrs is not None:
+                        base_lr = self.cfg.lambda_lrs.get("energy", self.cfg.lambda_lr)
+                    else:
+                        base_lr = self.cfg.lambda_lr
+                    
+                    # EMA 平滑（若启用）
+                    if self.cfg.lambda_gap_ema_beta > 0:
+                        beta = self.cfg.lambda_gap_ema_beta
+                        # 复用 ema_gaps["energy"] 存储 total gap 的 EMA
+                        self.ema_gaps["energy"] = (1 - beta) * self.ema_gaps.get("energy", 0.0) + beta * gap_for_update
+                        effective_gap = self.ema_gaps["energy"]
+                    else:
+                        effective_gap = gap_for_update
+                    
+                    gap_ema_for_log["total"] = effective_gap
+                    
+                    # deadzone（若启用）
+                    deadzone = self.cfg.lambda_deadzone
+                    if deadzone > 0 and abs(effective_gap) < deadzone:
+                        effective_gap = 0.0
+                    
+                    # 更新 lambda_total
+                    new_lambda = max(0.0, self.lambdas["energy"] + base_lr * effective_gap)
+                    
+                    # lambda_max clamp
+                    if self.cfg.lambda_max is not None:
+                        new_lambda = min(new_lambda, self.cfg.lambda_max)
+                    
+                    self.lambdas["energy"] = new_lambda
+                    gap_used_for_update["energy"] = effective_gap
+                    # load lambda 保持为 0
+                    gap_used_for_update["load"] = 0.0
+                else:
+                    # 未到更新频率
+                    gap_used_for_update["energy"] = 0.0
+                    gap_used_for_update["load"] = 0.0
+                    
+            else:
+                # ========== separate 模式的 dual update（保持原逻辑） ==========
+                # 预备：选择用于 dual 更新的原始 gap（ratio 或 absolute）
+                gap_for_mode = risk_ratio_gaps if self.cfg.lambda_gap_mode == "ratio" else risk_gaps
 
             # ====== dual 模式：hysteresis / decorrelated / both ======
             if self.cfg.dual_update_mode != "standard":
@@ -596,34 +1024,132 @@ class MultiCriticPPO:
 
                 # 2) 相关性消耦（仅 energy-load 对）
                 corr_val = 0.0
-                if self.cfg.dual_update_mode in ("decorrelated", "both") and {"energy", "load"}.issubset(set(self.cost_names)):
+                varE = varL = covEL = 0.0
+                precond_diag: Dict[str, float] = {}
+                has_e_l = {"energy", "load"}.issubset(set(self.cost_names))
+                gE = dual_gbar.get("energy", 0.0)
+                gL = dual_gbar.get("load", 0.0)
+
+                if has_e_l and self.cfg.dual_update_mode in ("decorrelated", "both", "precond", "preconditioned"):
                     b = self.cfg.dual_corr_ema_beta
-                    gE = dual_gbar["energy"]
-                    gL = dual_gbar["load"]
+                    use_ema_stats = self.cfg.dual_precond_use_ema_stats or self.cfg.dual_update_mode in ("decorrelated", "both")
 
-                    meanE = (1 - b) * self.dual_corr_state["mean"]["energy"] + b * gE
-                    meanL = (1 - b) * self.dual_corr_state["mean"]["load"] + b * gL
-                    varE = (1 - b) * self.dual_corr_state["var"]["energy"] + b * (gE - meanE) ** 2
-                    varL = (1 - b) * self.dual_corr_state["var"]["load"] + b * (gL - meanL) ** 2
-                    covEL = (1 - b) * self.dual_corr_state["cov"] + b * (gE - meanE) * (gL - meanL)
+                    meanE = self.dual_corr_state["mean"]["energy"]
+                    meanL = self.dual_corr_state["mean"]["load"]
+                    if use_ema_stats:
+                        meanE = (1 - b) * meanE + b * gE
+                        meanL = (1 - b) * meanL + b * gL
+                        varE = (1 - b) * self.dual_corr_state["var"]["energy"] + b * (gE - meanE) ** 2
+                        varL = (1 - b) * self.dual_corr_state["var"]["load"] + b * (gL - meanL) ** 2
+                        covEL = (1 - b) * self.dual_corr_state["cov"] + b * (gE - meanE) * (gL - meanL)
 
-                    # 保存状态
-                    self.dual_corr_state["mean"]["energy"] = meanE
-                    self.dual_corr_state["mean"]["load"] = meanL
-                    self.dual_corr_state["var"]["energy"] = varE
-                    self.dual_corr_state["var"]["load"] = varL
-                    self.dual_corr_state["cov"] = covEL
+                        self.dual_corr_state["mean"]["energy"] = meanE
+                        self.dual_corr_state["mean"]["load"] = meanL
+                        self.dual_corr_state["var"]["energy"] = varE
+                        self.dual_corr_state["var"]["load"] = varL
+                        self.dual_corr_state["cov"] = covEL
+                    else:
+                        varE = gE * gE
+                        varL = gL * gL
+                        covEL = gE * gL
 
                     denom = varE * varL
-                    if denom < 1e-8:
-                        corr_val = 0.0
-                    else:
-                        corr_val = float(np.clip(covEL / np.sqrt(denom + 1e-8), -0.95, 0.95))
+                    if self.cfg.dual_update_mode in ("decorrelated", "both"):
+                        if denom < 1e-8:
+                            corr_val = 0.0
+                        else:
+                            corr_val = float(np.clip(covEL / np.sqrt(denom + 1e-8), -0.95, 0.95))
                 corr_gap_for_log = corr_val
 
-                # decorrelate（若需要）
                 dual_source = dual_gbar
-                if self.cfg.dual_update_mode in ("decorrelated", "both") and {"energy", "load"}.issubset(set(self.cost_names)):
+
+                # 预条件化（仅 energy-load 对）- Diag-Only 版本
+                if has_e_l and self.cfg.dual_update_mode in ("precond", "preconditioned"):
+                    eps = self.cfg.dual_precond_eps
+                    clip_val = self.cfg.dual_precond_clip
+                    strength = self.cfg.dual_precond_strength
+
+                    # Fallback 检测：varE 或 varL 非有限时触发
+                    fallback = 0
+                    if not np.isfinite(varE) or not np.isfinite(varL):
+                        fallback = 1
+                        scale_E = 1.0
+                        scale_L = 1.0
+                    else:
+                        scale_E = 1.0 / (varE + eps)
+                        scale_L = 1.0 / (varL + eps)
+
+                    # 构造 g_pre = [gE * scale_E, gL * scale_L]
+                    g_pre_energy = gE * scale_E
+                    g_pre_load = gL * scale_L
+
+                    # Strength 混合：g_used_raw = (1-strength)*g + strength*g_pre
+                    g_used_energy_raw = (1 - strength) * gE + strength * g_pre_energy
+                    g_used_load_raw = (1 - strength) * gL + strength * g_pre_load
+
+                    # Clip g_used 的每个分量
+                    g_used_energy_clipped = float(np.clip(g_used_energy_raw, -clip_val, clip_val))
+                    g_used_load_clipped = float(np.clip(g_used_load_raw, -clip_val, clip_val))
+
+                    # 统计 clip_hit：基于 raw 值判断
+                    clip_hit_e = 1.0 if abs(g_used_energy_raw) >= clip_val - 1e-6 else 0.0
+                    clip_hit_l = 1.0 if abs(g_used_load_raw) >= clip_val - 1e-6 else 0.0
+                    self.precond_clip_history["energy"].append(clip_hit_e)
+                    self.precond_clip_history["load"].append(clip_hit_l)
+                    # 保持窗口大小
+                    if len(self.precond_clip_history["energy"]) > self.precond_clip_window:
+                        self.precond_clip_history["energy"].pop(0)
+                    if len(self.precond_clip_history["load"]) > self.precond_clip_window:
+                        self.precond_clip_history["load"].pop(0)
+
+                    # 计算 clip_hit_rate
+                    clip_hit_rate_e = np.mean(self.precond_clip_history["energy"]) if self.precond_clip_history["energy"] else 0.0
+                    clip_hit_rate_l = np.mean(self.precond_clip_history["load"]) if self.precond_clip_history["load"] else 0.0
+
+                    dual_source = dual_gbar.copy()
+                    dual_source["energy"] = g_used_energy_clipped
+                    dual_source["load"] = g_used_load_clipped
+
+                    shrink_E = g_used_energy_clipped / (gE + 1e-8)
+                    shrink_L = g_used_load_clipped / (gL + 1e-8)
+
+                    # 条件数近似：用 scale 的比值定义
+                    if fallback == 1:
+                        cond_approx = 1.0
+                    else:
+                        max_scale = max(scale_E, scale_L)
+                        min_scale = min(scale_E, scale_L)
+                        cond_approx = max_scale / max(min_scale, 1e-12)
+
+                    precond_diag = {
+                        "dual_precond_var_energy": float(varE),
+                        "dual_precond_var_load": float(varL),
+                        "dual_precond_scale_energy": float(scale_E),
+                        "dual_precond_scale_load": float(scale_L),
+                        "dual_precond_gtilde_energy_raw": float(g_used_energy_raw),
+                        "dual_precond_gtilde_load_raw": float(g_used_load_raw),
+                        "dual_precond_gtilde_energy": float(g_used_energy_clipped),
+                        "dual_precond_gtilde_load": float(g_used_load_clipped),
+                        "dual_precond_g_energy": float(gE),
+                        "dual_precond_g_load": float(gL),
+                        "dual_precond_shrink_energy": float(shrink_E),
+                        "dual_precond_shrink_load": float(shrink_L),
+                        "dual_precond_clip_hit_rate_energy": float(clip_hit_rate_e),
+                        "dual_precond_clip_hit_rate_load": float(clip_hit_rate_l),
+                        "dual_precond_fallback": fallback,
+                        "dual_precond_cond_approx": float(cond_approx),
+                    }
+
+                    if should_update_lambda:
+                        print(
+                            f"[DUAL-PRECOND] g=({gE:.4f},{gL:.4f}) scale=({scale_E:.4f},{scale_L:.4f}) "
+                            f"raw=({g_used_energy_raw:.4f},{g_used_load_raw:.4f}) used=({g_used_energy_clipped:.4f},{g_used_load_clipped:.4f}) "
+                            f"var=({varE:.4f},{varL:.4f}) cond~{cond_approx:.2f} "
+                            f"shrink=({shrink_E:.3f},{shrink_L:.3f}) clip_rate=({clip_hit_rate_e:.2%},{clip_hit_rate_l:.2%}) fallback={fallback}"
+                        )
+
+                # decorrelate（若需要）
+                if self.cfg.dual_update_mode in ("decorrelated", "both") and has_e_l:
                     gtilde_energy = dual_gbar["energy"] - corr_val * dual_gbar["load"]
                     gtilde_load = dual_gbar["load"] - corr_val * dual_gbar["energy"]
                     dual_source = dual_gbar.copy()
@@ -742,6 +1268,19 @@ class MultiCriticPPO:
             "entropy": total_entropy / denom,
         }
 
+        if grad_decomp_metrics:
+            metrics.update({k: float(v) for k, v in grad_decomp_metrics.items()})
+
+        if actor_decomp_enabled:
+            pg_loss_r_like = total_pg_r_like / max(1, decomp_update_steps)
+            pg_loss_p_like = total_pg_p_like / max(1, decomp_update_steps)
+            actor_decomp_stats.update({
+                "pg_loss_total": metrics["policy_loss"],
+                "pg_loss_r_like": pg_loss_r_like,
+                "pg_loss_p_like": pg_loss_p_like,
+            })
+            metrics.update(actor_decomp_stats)
+
         # 添加每个 cost 的 avg、λ、gap、KKT 残差、EMA gap
         # 注：kkt 使用更新后的 lambda 乘以原始 gap
         for name in self.cost_names:
@@ -759,8 +1298,25 @@ class MultiCriticPPO:
             if self.cfg.lambda_gap_ema_beta > 0:
                 metrics[f"ema_gap_{name}"] = self.ema_gaps[name]
 
+        # aggregated 模式额外添加 total_cost 相关指标
+        if self.is_aggregated_mode:
+            metrics["cost_total_mean"] = avg_cost_total
+            metrics["cost_total_std"] = std_cost_total
+            if self.cfg.agg_cost_normalize_by_budget:
+                metrics["cost_total_budget"] = 1.0
+            else:
+                energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
+                load_budget = self.cfg.cost_budgets.get("load", 1.0)
+                metrics["cost_total_budget"] = self.cfg.agg_cost_w_energy * energy_budget + self.cfg.agg_cost_w_load * load_budget
+            metrics["gap_total"] = gap_total
+            metrics["gap_ratio_total"] = ratio_gap_total
+            metrics["lambda_total"] = self.lambdas["energy"]  # lambda_total 存储在 lambda_energy
+            metrics["kkt_total"] = self.lambdas["energy"] * gap_total
+            if self.cfg.lambda_gap_ema_beta > 0:
+                metrics["ema_gap_total"] = gap_ema_for_log.get("total", 0.0)
+
         # Dual 更新相关的诊断（统一记录 ratio gap 及实际使用的 gap）
-        if {"energy", "load"}.issubset(set(self.cost_names)):
+        if {"energy", "load"}.issubset(set(self.cost_names)) and not self.is_aggregated_mode:
             metrics["gap_energy_raw"] = ratio_gaps.get("energy", 0.0)
             metrics["gap_load_raw"] = ratio_gaps.get("load", 0.0)
             metrics["gap_energy_ema"] = gap_ema_for_log.get("energy", ratio_gaps.get("energy", 0.0))
@@ -770,13 +1326,58 @@ class MultiCriticPPO:
             metrics["corr_gap_ema"] = corr_gap_for_log
             metrics["risk_gap_energy_raw"] = risk_ratio_gaps.get("energy", 0.0)
             metrics["risk_gap_load_raw"] = risk_ratio_gaps.get("load", 0.0)
+            if precond_diag:
+                metrics.update(precond_diag)
 
         metrics["lambda_gap_mode"] = self.cfg.lambda_gap_mode
         
         # [新增 4] 写入新指标
+        # rho_*: Safety Gym 风格的全局累计成本率 (cumulative_cost / total_steps)
         metrics.update(rho_metrics)
+        # approx_kl: PPO policy 更新的 KL 散度近似（判断 policy 是否还在动）
         metrics["approx_kl"] = np.mean(approx_kls) if approx_kls else 0.0
+        # clip_frac: PPO ratio 被 clip 的比例（更新强度辅助）
         metrics["clip_frac"] = np.mean(clip_fracs) if clip_fracs else 0.0
+        # actor 参数变化尺度（E2）
+        metrics["actor_param_delta_l2"] = actor_param_delta_l2
+        metrics["actor_param_norm_l2"] = actor_param_norm_l2
+        metrics["actor_param_delta_ratio"] = actor_param_delta_ratio
+        # adv_*: advantage 统计（诊断1：cost 是否真的在推动 policy）
+        #   - adv_reward_abs_mean: |adv_reward| 的均值
+        #   - adv_penalty_abs_mean: |penalty_adv_total| 的均值
+        #   - adv_penalty_to_reward_ratio: penalty 在优势层的占比
+        metrics.update(adv_penalty_metrics)
+        # lambdaA_*: 分约束的拉格朗日项贡献（诊断 cost 作用强度）
+        #   - lambdaA_energy_abs_mean: |lambda_energy * adv_energy| 的均值
+        #   - lambdaA_load_abs_mean: |lambda_load * adv_load| 的均值
+        #   - lambdaA_total_abs_mean: 总惩罚项的绝对值均值
+        metrics.update(lambdaA_metrics)
+
+        if actor_decomp_enabled:
+            print(
+                "[actor-decomp] iter=%d | lambda_load=%.4f | penalty_abs_mean=%.4f | pg_loss_r_like=%.4f | pg_loss_p_like=%.4f | pg_loss_total=%.4f"
+                % (
+                    self._iter_count,
+                    actor_decomp_stats.get("lambda_load", 0.0),
+                    actor_decomp_stats.get("penalty_abs_mean", 0.0),
+                    actor_decomp_stats.get("pg_loss_r_like", 0.0),
+                    actor_decomp_stats.get("pg_loss_p_like", 0.0),
+                    metrics.get("policy_loss", 0.0),
+                )
+            )
+
+        # [Sanity Check] 第一次 update 时打印关键诊断字段（验证日志完整性）
+        if self._iter_count == 1:
+            diag_keys = [
+                "approx_kl", "clip_frac", "entropy",
+                "adv_reward_abs_mean", "adv_penalty_abs_mean", "adv_penalty_to_reward_ratio",
+                "lambdaA_energy_abs_mean", "lambdaA_load_abs_mean", "lambdaA_total_abs_mean",
+            ]
+            missing = [k for k in diag_keys if k not in metrics]
+            if missing:
+                print(f"[WARNING] Missing diagnostic keys in metrics: {missing}")
+            else:
+                print(f"[OK] All diagnostic keys present in metrics (iter={self._iter_count})")
 
         # 清空 buffer
         self._reset_buffer()

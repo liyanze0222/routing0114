@@ -204,10 +204,24 @@ class ScalarPPO:
         minibatch_size = min(self.cfg.minibatch_size, batch_size)
         indices = np.arange(batch_size)
         
+        actor_params = list(self.network.backbone.parameters()) + list(self.network.policy_head.parameters())
+
+        def _flatten_params(params):
+            if not params:
+                return torch.tensor([], dtype=torch.float32)
+            return torch.cat([p.detach().cpu().reshape(-1) for p in params])
+
+        with torch.no_grad():
+            actor_param_before = _flatten_params(actor_params)
+            actor_param_norm_l2 = (
+                torch.linalg.norm(actor_param_before).item() if actor_param_before.numel() > 0 else 0.0
+            )
+
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
         update_steps = 0
+        approx_kl = 0.0
         
         for epoch in range(self.cfg.update_epochs):
             np.random.shuffle(indices)
@@ -264,6 +278,14 @@ class ScalarPPO:
             
             if not continue_training:
                 break
+
+        with torch.no_grad():
+            actor_param_after = _flatten_params(actor_params)
+            delta_vec = actor_param_after - actor_param_before
+            actor_param_delta_l2 = (
+                torch.linalg.norm(delta_vec).item() if delta_vec.numel() > 0 else 0.0
+            )
+        actor_param_delta_ratio = actor_param_delta_l2 / (actor_param_norm_l2 + 1e-8)
         
         # 清空 buffer
         self._reset_buffer()
@@ -274,6 +296,9 @@ class ScalarPPO:
             "value_loss": total_value_loss / max(1, update_steps),
             "entropy": total_entropy / max(1, update_steps),
             "approx_kl": approx_kl,
+            "actor_param_delta_l2": actor_param_delta_l2,
+            "actor_param_norm_l2": actor_param_norm_l2,
+            "actor_param_delta_ratio": actor_param_delta_ratio,
         }
         
         return metrics

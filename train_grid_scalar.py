@@ -320,6 +320,14 @@ def main():
                 "energy_weight": args.energy_weight,
                 "load_weight": args.load_weight,
             }
+
+            for key in [
+                "actor_param_delta_l2",
+                "actor_param_norm_l2",
+                "actor_param_delta_ratio",
+            ]:
+                if key in metrics:
+                    log_entry[key] = metrics[key]
             
             logger.log(log_entry)
             

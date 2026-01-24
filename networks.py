@@ -131,7 +131,7 @@ class MultiHeadActorCritic(nn.Module):
         self.value_head_mode = value_head_mode
         
         # 验证 mode
-        assert cost_critic_mode in {"separate", "shared"}, f"Invalid cost_critic_mode: {cost_critic_mode}"
+        assert cost_critic_mode in {"separate", "shared", "aggregated"}, f"Invalid cost_critic_mode: {cost_critic_mode}"
         assert value_head_mode in {"standard", "shared_all"}, f"Invalid value_head_mode: {value_head_mode}"
 
         # 完全解耦的backbone
@@ -153,6 +153,9 @@ class MultiHeadActorCritic(nn.Module):
             elif cost_critic_mode == "shared":
                 # 单个共享 head，输出维度 = len(cost_names)
                 self.v_cost_head_shared = layer_init(nn.Linear(hidden_dim, len(self.cost_names)), std=1.0)
+            elif cost_critic_mode == "aggregated":
+                # aggregated 模式：单个 total cost value head
+                self.v_cost_total_head = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
         elif value_head_mode == "shared_all":
             # 单头输出 reward + 所有 cost，复用 cost_backbone 作为 critic backbone
             self.v_all_head = layer_init(nn.Linear(hidden_dim, 1 + len(self.cost_names)), std=1.0)
@@ -217,6 +220,10 @@ class MultiHeadActorCritic(nn.Module):
                     name: v_vec[:, i]  # [batch]
                     for i, name in enumerate(self.cost_names)
                 }
+            elif self.cost_critic_mode == "aggregated":
+                # aggregated 模式：仅返回一个 "total" key
+                v_cost_total = self.v_cost_total_head(cost_features).squeeze(-1)  # [batch]
+                v_costs = {"total": v_cost_total}
         elif self.value_head_mode == "shared_all":
             # 单个 head 输出 reward + 所有 cost，保持输出形状与现有代码兼容（挤掉最后一维）
             critic_features = cost_features
