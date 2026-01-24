@@ -184,7 +184,8 @@ class GridRoutingEnv(gym.Env):
         truncated = False
 
         # 是否到达目标
-        if self.agent_row == self.goal_row and self.agent_col == self.goal_col:
+        reached_goal = (self.agent_row == self.goal_row and self.agent_col == self.goal_col)
+        if reached_goal:
             reward += self.success_reward
             terminated = True
 
@@ -193,7 +194,10 @@ class GridRoutingEnv(gym.Env):
             truncated = True
 
         obs = self._get_obs()
-        info: Dict[str, Any] = {}
+        info: Dict[str, Any] = {
+            "success": reached_goal,
+            "reached_goal": reached_goal,
+        }
 
         return obs, reward, terminated, truncated, info
 

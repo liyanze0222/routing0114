@@ -52,7 +52,7 @@ from grid_energy_obs_wrapper import GridEnergyObsWrapper
 from grid_obs_norm_wrapper import GridObsNormWrapper
 from ppo_multi_agent import MultiCriticPPOConfig, MultiCriticPPO
 from utils import set_seed, MetricsLogger, plot_training_curves, plot_safety_gym_curves, make_output_dir, save_grid_route_viz
-from check_cost_units import run_cost_unit_check
+# from check_cost_units import run_cost_unit_check  # Optional module
 
 
 class CurriculumScheduler:
@@ -209,8 +209,8 @@ def parse_args():
     # ========== Dual(λ) 更新模式（向后兼容：默认 standard） ==========
     parser.add_argument(
         "--dual_update_mode", type=str, default="standard",
-        choices=["standard", "hysteresis", "decorrelated", "both"],
-        help="dual 更新模式：standard=旧行为；hysteresis=gap EMA+死区+滞回；decorrelated=相关性消耦；both=先消耦再滞回"
+        choices=["standard", "hysteresis", "decorrelated", "both", "precond", "preconditioned"],
+        help="dual 更新模式：standard=旧行为；hysteresis=gap EMA+死区+滞回；decorrelated=相关性消耦；both=先消耦再滞回；precond=协方差预条件化"
     )
     parser.add_argument(
         "--dual_gap_ema_beta", type=float, default=0.10,
@@ -227,6 +227,15 @@ def parse_args():
     parser.add_argument(
         "--dual_corr_ema_beta", type=float, default=0.05,
         help="dual decorrelated 模式相关性估计的 EMA 系数"
+    )
+    parser.add_argument("--dual_precond_eps", type=float, default=0.05, help="预条件化对角稳定项 eps")
+    parser.add_argument("--dual_precond_clip", type=float, default=2.0, help="预条件化后的 g 分量 clip")
+    parser.add_argument("--dual_precond_strength", type=float, default=0.3, help="预条件化插值强度 0~1")
+    parser.add_argument(
+        "--dual_precond_use_ema_stats",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="是否使用 EMA 统计 (dual_corr_state) 构建协方差"
     )
 
     # ========== 约束预算 ==========
@@ -312,13 +321,27 @@ def parse_args():
     # ========== E: Shared Cost Critic ==========
     parser.add_argument(
         "--cost_critic_mode", type=str, default="separate",
-        choices=["separate", "shared"],
-        help="E: Cost critic 模式 - 'separate'（默认，独立 value head）或 'shared'（共享 value head）"
+        choices=["separate", "shared", "aggregated"],
+        help="E: Cost critic 模式 - 'separate'（默认，独立 value head）、'shared'（共享 value head）或 'aggregated'（two-critic: V_reward + V_cost_total）"
     )
     parser.add_argument(
         "--value_head_mode", type=str, default="standard",
         choices=["standard", "shared_all"],
         help="Value head 模式: standard=默认分头; shared_all=单头输出 reward+所有 cost"
+    )
+    
+    # ========== Aggregated Cost 模式参数（仅 cost_critic_mode='aggregated' 时使用） ==========
+    parser.add_argument(
+        "--agg_cost_w_energy", type=float, default=1.0,
+        help="Aggregated 模式：energy cost 的权重（默认 1.0）"
+    )
+    parser.add_argument(
+        "--agg_cost_w_load", type=float, default=1.0,
+        help="Aggregated 模式：load cost 的权重（默认 1.0）"
+    )
+    parser.add_argument(
+        "--agg_cost_normalize_by_budget", type=lambda x: x.lower() == "true", default=True,
+        help="Aggregated 模式：是否按预算归一化 total_cost（True=相对预算消耗，False=直接加权和）"
     )
 
     # ========== B/C: Best Feasible Checkpoint & Early Stop ==========
@@ -369,6 +392,18 @@ def parse_args():
     parser.add_argument("--value_coef", type=float, default=0.5, help="value loss 系数")
     parser.add_argument("--cost_value_coef", type=float, default=1.0, help="cost value loss 权重")
     parser.add_argument("--max_grad_norm", type=float, default=0.5, help="梯度裁剪")
+    parser.add_argument(
+        "--log_actor_decomp", type=lambda x: x.lower() == "true", default=False,
+        help="是否记录 actor loss 分解日志（默认 False）"
+    )
+    parser.add_argument(
+        "--log_actor_grad_decomp", type=lambda x: x.lower() == "true", default=False,
+        help="是否记录 actor 梯度分解（A2，默认 False）"
+    )
+    parser.add_argument(
+        "--grad_decomp_interval", type=int, default=100,
+        help="梯度分解记录间隔（按 policy update 计数，默认 100）"
+    )
 
     # ========== 输出设置 ==========
     parser.add_argument(
@@ -614,6 +649,7 @@ def main():
     if args.unit_check:
         print("[UnitCheck] Running cost unit consistency check before training...")
         try:
+            from check_cost_units import run_cost_unit_check
             summary, _ = run_cost_unit_check(
                 vars(args),
                 episodes=args.unit_check_episodes,
@@ -625,6 +661,8 @@ def main():
             with open(summary_path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2)
             print(f"[UnitCheck] Summary saved to {summary_path}")
+        except ImportError:
+            print("[UnitCheck] check_cost_units module not found, skipping unit check.")
         except Exception as e:
             print(f"[UnitCheck] Failed to run unit check: {e}")
         # 重新设定随机种子，避免对后续训练产生影响
@@ -813,9 +851,20 @@ def main():
         dual_deadband=args.dual_deadband,
         dual_lr_down_scale=args.dual_lr_down_scale,
         dual_corr_ema_beta=args.dual_corr_ema_beta,
+        dual_precond_eps=args.dual_precond_eps,
+        dual_precond_clip=args.dual_precond_clip,
+        dual_precond_strength=args.dual_precond_strength,
+        dual_precond_use_ema_stats=args.dual_precond_use_ema_stats,
         # cost critic 模式
         cost_critic_mode=args.cost_critic_mode,
         value_head_mode=args.value_head_mode,
+        # aggregated cost 模式参数
+        agg_cost_w_energy=args.agg_cost_w_energy,
+        agg_cost_w_load=args.agg_cost_w_load,
+        agg_cost_normalize_by_budget=args.agg_cost_normalize_by_budget,
+        log_actor_decomp=args.log_actor_decomp,
+        log_actor_grad_decomp=args.log_actor_grad_decomp,
+        grad_decomp_interval=args.grad_decomp_interval,
         device=device,
     )
 
@@ -1027,6 +1076,28 @@ def main():
             "kkt_energy": metrics.get("kkt_energy", metrics["lambda_energy"] * (metrics["avg_cost_energy"] - args.energy_budget)),
             "kkt_load": metrics.get("kkt_load", metrics["lambda_load"] * (metrics["avg_cost_load"] - args.load_budget)),
         }
+
+        if args.log_actor_decomp:
+            actor_keys = [
+                "adv_r_mean", "adv_r_std",
+                "adv_energy_mean", "adv_energy_std",
+                "adv_load_mean", "adv_load_std",
+                "lambda_energy", "lambda_load",
+                "penalty_mean", "penalty_abs_mean",
+                "adv_eff_mean", "adv_eff_std",
+                "pg_loss_total", "pg_loss_r_like", "pg_loss_p_like",
+            ]
+            for key in actor_keys:
+                if key in metrics:
+                    log_entry[key] = metrics[key]
+
+        # A2 梯度分解日志（仅当启用时返回）
+        for key in [
+            "g_r_norm", "g_c_norm", "g_t_norm",
+            "g_c_over_r", "cos_total_r", "cos_total_c",
+        ]:
+            if key in metrics:
+                log_entry[key] = metrics[key]
         # 风险敏感指标（若开启）
         for key in [
             "std_cost_energy",
@@ -1060,23 +1131,48 @@ def main():
         ]:
             if key in metrics:
                 log_entry[key] = metrics[key]
+        for key in metrics:
+            if key.startswith("dual_precond_"):
+                log_entry[key] = metrics[key]
         # 添加 EMA gap（如果存在）
         if "ema_gap_energy" in metrics:
             log_entry["ema_gap_energy"] = metrics["ema_gap_energy"]
         if "ema_gap_load" in metrics:
             log_entry["ema_gap_load"] = metrics["ema_gap_load"]
         
-        # [修复 Bug B] 添加 Safety Gym 指标到 log_entry（在 logger.log 之前）
-        # 1. 添加 rho_* 指标
+        # [新增] 添加诊断指标到 log_entry（在 logger.log 之前）
+        # 1. Safety Gym 风格累计成本率：rho_* = cumulative_cost / total_steps
         for key in metrics:
             if key.startswith("rho_"):
                 log_entry[key] = metrics[key]
         
-        # 2. 添加 PPO 诊断指标
+        # 2. PPO 更新诊断（判断 policy 是否还在动）
         if "approx_kl" in metrics:
             log_entry["approx_kl"] = metrics["approx_kl"]
         if "clip_frac" in metrics:
             log_entry["clip_frac"] = metrics["clip_frac"]
+        for key in [
+            "actor_param_delta_l2",
+            "actor_param_norm_l2",
+            "actor_param_delta_ratio",
+        ]:
+            if key in metrics:
+                log_entry[key] = metrics[key]
+
+        # 3. Advantage penalty diagnostics（核心诊断：cost 是否真的在推动 policy）
+        #    所有统计量基于"actor 实际使用的 normalized advantage"
+        for key in [
+            "adv_reward_abs_mean",        # |adv_reward| 均值
+            "adv_penalty_abs_mean",       # |penalty_adv_total| 均值
+            "adv_penalty_to_reward_ratio",# penalty 占 reward 的比例
+            "adv_reward_mean",            # adv_reward 均值（带符号）
+            "adv_penalty_mean",           # penalty_adv 均值（带符号）
+            "lambdaA_energy_abs_mean",    # |lambda_energy * adv_energy| 均值
+            "lambdaA_load_abs_mean",      # |lambda_load * adv_load| 均值
+            "lambdaA_total_abs_mean",     # 总惩罚项绝对值均值
+        ]:
+            if key in metrics:
+                log_entry[key] = metrics[key]
         
         # 3. 计算 Safety Gym episode 指标
         if len(train_infos_buffer) > 0:
@@ -1321,7 +1417,7 @@ def main():
 
             # 4. 写入到 log_entry (供 JSON 保存)
             # 注意：此时 log_entry 已在上面创建，这里需要更新它
-            log_entry.update({
+            log_entry_sg_metrics = {
                 "avg_energy_success": avg_energy_success,
                 "avg_load_success": avg_load_success,
                 "feasible_success_rate": feasible_success_rate,
@@ -1329,7 +1425,8 @@ def main():
                 "feasible_success_count": feasible_success_count,
                 "num_success_episodes": len(success_episodes),
                 "num_episodes_buffer": len(train_infos_buffer),
-            })
+            }
+            log_entry.update(log_entry_sg_metrics)
 
             print("=" * 70)
             print(f"Iteration {iteration}/{args.total_iters} | "
@@ -1351,10 +1448,10 @@ def main():
                 print(f"Risk cost (load):   {metrics['risk_cost_load']:.4f} "
                     f"(gap: {metrics['risk_gap_load']:+.4f})")
             print("-" * 70)
-            # [新增] Safety Gym 风格指标打印
-            print(f"Success-only costs: Energy={avg_energy_success:.4f}, Load={avg_load_success:.4f}")
-            print(f"Feasible & Success Rate: {feasible_success_rate:.2%} ({feasible_success_count}/{len(train_infos_buffer)} eps)")
-            print(f"Feasible given Success: {feasible_given_success:.2%} ({feasible_success_count}/{len(success_episodes)} success eps)")
+            # [新增] Safety Gym 风格指标打印（从 log_entry 读取，避免重复 update）
+            print(f"Success-only costs: Energy={log_entry['avg_energy_success']:.4f}, Load={log_entry['avg_load_success']:.4f}")
+            print(f"Feasible & Success Rate: {log_entry['feasible_success_rate']:.2%} ({log_entry['feasible_success_count']}/{log_entry['num_episodes_buffer']} eps)")
+            print(f"Feasible given Success: {log_entry['feasible_given_success']:.2%} ({log_entry['feasible_success_count']}/{log_entry['num_success_episodes']} success eps)")
             print("-" * 70)
             print(f"Lambda (energy): {metrics['lambda_energy']:.4f} | "
                   f"Lambda (load): {metrics['lambda_load']:.4f}")
