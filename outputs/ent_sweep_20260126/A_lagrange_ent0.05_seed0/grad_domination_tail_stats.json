@@ -1,0 +1,13 @@
+{
+  "g_c_over_r_mean": 1.4552056449850024,
+  "g_c_over_r_median": 1.3216986455767832,
+  "g_c_over_r_gt1_pct": 74.50980392156863,
+  "cos_total_c_mean": 0.8551244552175558,
+  "cos_total_c_median": 0.9080626443704981,
+  "cos_total_c_gt08_pct": 86.27450980392157,
+  "apdr_mean": 0.008721366026913606,
+  "apdr_median": 0.008048329458542869,
+  "apdr_gt0_pct": 100.0,
+  "tail_count": 51,
+  "tail_start": 150
+}

@@ -96,15 +96,13 @@ def make_env_from_config(cfg: dict, seed: int):
     max_steps = cfg.get("max_steps", 256)
     congestion_pattern = cfg.get("congestion_pattern", "block")
     congestion_density = cfg.get("congestion_density", 0.40)
-    energy_high_cost = cfg.get("energy_high_cost", 3.0)
     energy_high_density = cfg.get("energy_high_density", 0.20)
-    load_cost_scale = cfg.get("load_cost_scale", 1.0)
+    load_threshold = cfg.get("load_threshold", 0.6)
 
     include_congestion_obs = cfg.get("include_congestion_obs", True)
     congestion_patch_radius = cfg.get("congestion_patch_radius", 2)
     include_energy_obs = cfg.get("include_energy_obs", True)
     energy_patch_radius = cfg.get("energy_patch_radius", 2)
-    energy_obs_normalize = cfg.get("energy_obs_normalize", True)
     obs_rms = cfg.get("obs_rms", False)
 
     env = GridRoutingEnv(
@@ -117,19 +115,16 @@ def make_env_from_config(cfg: dict, seed: int):
         env,
         congestion_pattern=congestion_pattern,
         congestion_density=congestion_density,
-        energy_high_cost=energy_high_cost,
         energy_high_density=energy_high_density,
-        load_cost_scale=load_cost_scale,
+        load_threshold=load_threshold,
     )
     # 注意：hard wrapper 在 obs wrapper 之前（与训练/评估一致）
     env = GridHardWrapper(env)
     if include_congestion_obs:
         env = GridCongestionObsWrapper(env, patch_radius=congestion_patch_radius)
     if include_energy_obs:
-        env = GridEnergyObsWrapper(env, patch_radius=energy_patch_radius, normalize=energy_obs_normalize)
+        env = GridEnergyObsWrapper(env, patch_radius=energy_patch_radius)
     if obs_rms:
-        env = GridObsNormWrapper(env)
-    if energy_obs_normalize:
         env = GridObsNormWrapper(env)
 
     env.reset(seed=seed)
@@ -230,6 +225,9 @@ def plot_traj(
     goal_rc,
     grid_size,
     heatmap=None,
+    energy_map=None,
+    energy_threshold=0.0,
+    energy_text_color="cyan",
     visit_map=None,
     title="",
     no_color=False,
@@ -237,6 +235,8 @@ def plot_traj(
     arrow_every=5,
     annotate=False,
     annotate_fmt="{:.0f}",
+    footer_lines=None,
+    base_cmap="YlOrRd",
     save_path=None,
 ):
     traj_rc = np.asarray(traj_rc, dtype=np.int32)
@@ -248,11 +248,15 @@ def plot_traj(
 
     if heatmap is not None:
         n = heatmap.shape[0]
+        vmax = float(np.max(heatmap)) if np.max(heatmap) > 0 else 1.0
         ax.imshow(
             heatmap,
             origin="upper",
             extent=(-0.5, n - 0.5, n - 0.5, -0.5),
             interpolation="nearest",
+            cmap=base_cmap,
+            vmin=0.0,
+            vmax=vmax,
         )
     else:
         n = grid_size
@@ -304,10 +308,34 @@ def plot_traj(
                     alpha=0.75,
                 )
 
+    # Overlay energy cells as bright text so load colormap stays intact
+    if energy_map is not None:
+        for r in range(n):
+            for c in range(n):
+                val = energy_map[r, c]
+                if val > energy_threshold:
+                    ax.text(
+                        c,
+                        r,
+                        f"{val:.0f}",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        fontweight="bold",
+                        color=energy_text_color,
+                        alpha=0.9,
+                    )
+
     ax.set_xlabel("col (x)")
     ax.set_ylabel("row (y)")
     ax.grid(False)
     ax.legend()
+
+    # Footer text for quick stats under the figure
+    if footer_lines:
+        fig = plt.gcf()
+        footer = "\n".join(footer_lines)
+        fig.text(0.01, -0.06, footer, ha="left", va="top", fontsize=9)
 
     if save_path:
         plt.savefig(save_path, dpi=200, bbox_inches="tight")

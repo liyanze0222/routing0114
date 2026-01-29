@@ -6,7 +6,7 @@ import pandas as pd
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # 引入你的环境和网络定义
 from grid_env import GridRoutingEnv
@@ -31,6 +31,37 @@ def _get_action_mask(env):
         cur = getattr(cur, "env", None)
     return None
 
+
+def _str2bool(val: str) -> bool:
+    return str(val).lower() in {"1", "true", "yes"}
+
+
+def _parse_rect(val):
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple)) and len(val) == 4:
+        return tuple(int(x) for x in val)
+    if isinstance(val, str):
+        try:
+            parts = [int(p) for p in val.split(",")]
+            if len(parts) == 4:
+                return tuple(parts)
+        except Exception:
+            return None
+    return None
+
+
+def find_cost_wrapper(env):
+    """Traverse wrapper stack to locate GridCostWrapper."""
+    cur = env
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, GridCostWrapper):
+            return cur
+        cur = getattr(cur, "env", None)
+    return None
+
 def get_oracle_cost(env, weight_key='load'):
     """使用 Dijkstra 计算给定环境状态下的最优代价"""
     # 构建图
@@ -39,7 +70,7 @@ def get_oracle_cost(env, weight_key='load'):
     start = (env.unwrapped.agent_row, env.unwrapped.agent_col)
     goal = (env.unwrapped.goal_row, env.unwrapped.goal_col)
     
-    # 寻找 CostWrapper 获取 map 和 scale
+    # 寻找 CostWrapper 获取 map
     cost_wrapper = None
     curr = env
     while hasattr(curr, 'env'):
@@ -50,13 +81,18 @@ def get_oracle_cost(env, weight_key='load'):
     if cost_wrapper is None: 
         cost_wrapper = env.unwrapped
     
-    # 获取 load_cost_scale（关键修复）
-    load_scale = getattr(cost_wrapper, 'load_cost_scale', 1.0)
+    # 获取 load_threshold（用于 soft-threshold 公式）
+    load_threshold = getattr(cost_wrapper, 'load_threshold', 0.6)
 
     for u, v in G.edges():
         r, c = v
         if weight_key == 'load':
-            cost = cost_wrapper._congestion_map[r, c] * load_scale  # 应用缩放
+            # 应用同样的 soft-threshold 公式
+            raw = cost_wrapper._congestion_map[r, c]
+            if load_threshold < 1.0:
+                cost = max(0.0, (raw - load_threshold) / (1.0 - load_threshold))
+            else:
+                cost = 0.0
         elif weight_key == 'energy':
             cost = cost_wrapper._energy_map[r, c]
         elif weight_key == 'steps':
@@ -71,7 +107,9 @@ def get_oracle_cost(env, weight_key='load'):
         for i in range(1, len(path)):
             pos = path[i]
             if weight_key == 'load':
-                total_cost += cost_wrapper._congestion_map[pos] * load_scale  # 应用缩放
+                raw = cost_wrapper._congestion_map[pos]
+                if load_threshold < 1.0:
+                    total_cost += max(0.0, (raw - load_threshold) / (1.0 - load_threshold))
             elif weight_key == 'energy':
                 total_cost += cost_wrapper._energy_map[pos]
             elif weight_key == 'steps':
@@ -131,12 +169,36 @@ def inject_obs_stats(env, checkpoint, config: Dict):
             target.norm_reward = False
         print("✅ Obs Stats injected & Frozen (Eval Mode).")
 
+
+def _select_action(
+    agent,
+    obs_t: torch.Tensor,
+    mask_t: Optional[torch.Tensor],
+    is_multi_head: bool,
+    deterministic: bool,
+):
+    """Unified action selector that respects deterministic flag and action mask."""
+    if deterministic:
+        if is_multi_head:
+            logits, _, _ = agent.forward(obs_t, action_mask=mask_t)
+        else:
+            logits, _ = agent.forward(obs_t)
+            if mask_t is not None:
+                logits = logits.masked_fill(mask_t == 0, float("-inf"))
+        return int(torch.argmax(logits, dim=-1).item())
+
+    if is_multi_head:
+        action, _, _, _, _ = agent.get_action(obs_t, action_mask=mask_t)
+    else:
+        action, _, _, _ = agent.get_action(obs_t, action_mask=mask_t)
+    return int(action)
+
 def evaluate_fixed_set(
     model_path: str,
     num_episodes: int = 100,
     seed_start: int = 0,
     device: str = "cpu",
-    deterministic: bool = True,
+    deterministic: bool = False,
     out_csv: str = None,
     # 环境参数（可从 config 覆盖）
     grid_size: int = 8,
@@ -145,9 +207,14 @@ def evaluate_fixed_set(
     max_steps: int = 256,
     congestion_pattern: str = "block",
     congestion_density: float = 0.40,
-    energy_high_cost: float = 3.0,
     energy_high_density: float = 0.20,
     patch_radius: int = 2,
+    start_goal_mode: Optional[str] = None,
+    start_rect: Optional[Tuple[int, int, int, int]] = None,
+    goal_rect: Optional[Tuple[int, int, int, int]] = None,
+    record_trajectory: bool = False,
+    out_npz: Optional[str] = None,
+    save_trajectory_json: Optional[str] = None,
 ):
     # 尝试从 checkpoint 目录加载配置
     config = load_config_from_dir(model_path)
@@ -159,26 +226,35 @@ def evaluate_fixed_set(
     max_steps = config.get('max_steps', max_steps)
     congestion_pattern = config.get('congestion_pattern', congestion_pattern)
     congestion_density = config.get('congestion_density', congestion_density)
-    energy_high_cost = config.get('energy_high_cost', energy_high_cost)
     energy_high_density = config.get('energy_high_density', energy_high_density)
-    load_cost_scale = config.get('load_cost_scale', 1.0)  # 关键：读取缩放参数
+    load_threshold = config.get('load_threshold', 0.6)
+    start_goal_mode = config.get('start_goal_mode', start_goal_mode or "random")
+    start_rect = _parse_rect(config.get('start_rect', start_rect))
+    goal_rect = _parse_rect(config.get('goal_rect', goal_rect))
+    energy_budget = config.get('energy_budget')
+    load_budget = config.get('load_budget')
+    if energy_budget is None or load_budget is None:
+        print("[WARN] energy_budget/load_budget not found in config; feasible will fall back to success.")
     
     # 观测配置（关键：必须与训练时一致）
     include_congestion_obs = config.get('include_congestion_obs', True)
     congestion_patch_radius = config.get('congestion_patch_radius', patch_radius)
     include_energy_obs = config.get('include_energy_obs', True)
     energy_patch_radius = config.get('energy_patch_radius', patch_radius)
-    energy_obs_normalize = config.get('energy_obs_normalize', True)
     obs_rms = config.get('obs_rms', False)
     
     print("\n========== Evaluation Environment Config ==========")
     print(f"Grid Size: {grid_size}, Max Steps: {max_steps}")
     print(f"Congestion: {congestion_pattern}, density={congestion_density}")
-    print(f"Energy: high_cost={energy_high_cost}, density={energy_high_density}")
-    print(f"Load Cost Scale: {load_cost_scale}x (CRITICAL: must match training!)")
+    print(f"Energy: density={energy_high_density}")
+    print(f"Load threshold: {load_threshold}")
+    print(f"Start/Goal: mode={start_goal_mode}, start_rect={start_rect}, goal_rect={goal_rect}")
     print(f"Observation: Congestion={include_congestion_obs} (r={congestion_patch_radius}), "
-          f"Energy={include_energy_obs} (r={energy_patch_radius}, norm={energy_obs_normalize})")
+          f"Energy={include_energy_obs} (r={energy_patch_radius})")
     print("=" * 50 + "\n")
+
+    # 评估保持固定地图（默认不在 reset 重采样）
+    randomize_maps_each_reset = False
     
     # 1. 配置与训练一致的环境
     def make_env(seed):
@@ -186,15 +262,18 @@ def evaluate_fixed_set(
             grid_size=grid_size,
             step_penalty=step_penalty,
             success_reward=success_reward,
-            max_steps=max_steps
+            max_steps=max_steps,
+            start_goal_mode=start_goal_mode,
+            start_rect=start_rect,
+            goal_rect=goal_rect,
         )
         env = GridCostWrapper(
             env,
             congestion_pattern=congestion_pattern,
             congestion_density=congestion_density,
-            energy_high_cost=energy_high_cost,
             energy_high_density=energy_high_density,
-            load_cost_scale=load_cost_scale  # 传递缩放参数
+            load_threshold=load_threshold,
+            randomize_maps_each_reset=randomize_maps_each_reset,
         )
         # 🔧 修正：Hard wrapper 必须在 obs wrappers 之前（与训练一致）
         env = GridHardWrapper(env)
@@ -202,7 +281,7 @@ def evaluate_fixed_set(
         if include_congestion_obs:
             env = GridCongestionObsWrapper(env, patch_radius=congestion_patch_radius)
         if include_energy_obs:
-            env = GridEnergyObsWrapper(env, patch_radius=energy_patch_radius, normalize=energy_obs_normalize)
+            env = GridEnergyObsWrapper(env, patch_radius=energy_patch_radius)
         if obs_rms:
             env = GridObsNormWrapper(env)
         env.reset(seed=seed)
@@ -216,7 +295,8 @@ def evaluate_fixed_set(
     temp_env.close()
     
     # 🔧 检测网络类型：从 checkpoint 中判断是 Multi-Head 还是 Scalar
-    checkpoint = torch.load(model_path, map_location=device)
+    # PyTorch 2.6 defaulted torch.load to weights_only=True; allow full objects for trusted checkpoints
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("network_state_dict", checkpoint.get("model_state_dict", checkpoint))
     
     # 判断依据：Multi-Head 有 v_cost_heads / actor_backbone / reward_backbone 等前缀
@@ -253,6 +333,12 @@ def evaluate_fixed_set(
 
     results = []
 
+    record_outputs = record_trajectory or (out_npz is not None) or (save_trajectory_json is not None)
+    visit_counts = np.zeros((grid_size, grid_size), dtype=np.int64) if record_outputs else None
+    visit_energy_counts = np.zeros((grid_size, grid_size), dtype=np.int64) if record_outputs else None
+    visit_load_counts = np.zeros((grid_size, grid_size), dtype=np.int64) if record_outputs else None
+    trajectory_records: Dict[int, List[Tuple[int, int]]] = {}
+
     print(f"Evaluating on fixed set (Seeds {seed_start}-{seed_start+num_episodes-1})...")
 
     for i in tqdm(range(num_episodes)):
@@ -260,6 +346,24 @@ def evaluate_fixed_set(
         env = make_env(seed)
         inject_obs_stats(env, checkpoint, config)
         obs, _ = env.reset(seed=seed)
+
+        cost_wrapper = find_cost_wrapper(env)
+        energy_map = getattr(cost_wrapper, "_energy_map", None) if cost_wrapper is not None else None
+        congestion_raw = getattr(cost_wrapper, "_congestion_map", None) if cost_wrapper is not None else None
+        load_threshold_env = getattr(cost_wrapper, "load_threshold", load_threshold)
+        traj: List[Tuple[int, int]] = []
+        if record_outputs:
+            r0, c0 = env.unwrapped.agent_row, env.unwrapped.agent_col
+            traj.append((r0, c0))
+            if 0 <= r0 < grid_size and 0 <= c0 < grid_size:
+                visit_counts[r0, c0] += 1
+                if energy_map is not None and energy_map[r0, c0] == 1:
+                    visit_energy_counts[r0, c0] += 1
+                load_hit = False
+                if congestion_raw is not None:
+                    load_hit = congestion_raw[r0, c0] > load_threshold_env
+                if load_hit:
+                    visit_load_counts[r0, c0] += 1
         
         # Oracle 计算
         oracle_min_load_sum, _ = get_oracle_cost(env, 'load')
@@ -273,6 +377,7 @@ def evaluate_fixed_set(
         ep_load = 0
         ep_len = 0
         success = False
+        feasible = False
         
         while not done:
             with torch.no_grad():
@@ -282,13 +387,13 @@ def evaluate_fixed_set(
                 if mask is not None:
                     mask_t = torch.as_tensor(mask, dtype=torch.float32).unsqueeze(0).to(device)
                 
-                # 🔧 根据网络类型调用不同的接口
-                if is_multi_head:
-                    # Multi-Head: 返回 (action, log_prob, v_reward, v_costs, entropy)
-                    action, _, _, _, _ = agent.get_action(obs_t, action_mask=mask_t)
-                else:
-                    # Scalar: 返回 (action, log_prob, entropy, value)
-                    action, _, _, _ = agent.get_action(obs_t, action_mask=mask_t)
+                action = _select_action(
+                    agent=agent,
+                    obs_t=obs_t,
+                    mask_t=mask_t,
+                    is_multi_head=is_multi_head,
+                    deterministic=deterministic,
+                )
             
             obs, reward, done, truncated, info = env.step(action)
             
@@ -301,14 +406,38 @@ def evaluate_fixed_set(
             total_reward += reward
             ep_len += 1
             
+            if record_outputs:
+                pos_r, pos_c = env.unwrapped.agent_row, env.unwrapped.agent_col
+                traj.append((pos_r, pos_c))
+                if 0 <= pos_r < grid_size and 0 <= pos_c < grid_size:
+                    visit_counts[pos_r, pos_c] += 1
+                    if energy_map is not None and energy_map[pos_r, pos_c] == 1:
+                        visit_energy_counts[pos_r, pos_c] += 1
+                    load_hit = False
+                    if congestion_raw is not None:
+                        load_hit = congestion_raw[pos_r, pos_c] > load_threshold_env
+                    if not load_hit and step_load > 0:
+                        load_hit = True
+                    if load_hit:
+                        visit_load_counts[pos_r, pos_c] += 1
+
             if done:
                 success = done and not truncated
-                break
             if truncated:
                 success = False
+            if done or truncated:
                 break
         
         env.close()
+
+        if record_outputs:
+            trajectory_records[seed] = traj
+
+        feasible = success
+        if energy_budget is not None:
+            feasible = feasible and (ep_energy / max(1, ep_len) <= energy_budget)
+        if load_budget is not None:
+            feasible = feasible and (ep_load / max(1, ep_len) <= load_budget)
         
         results.append({
             "seed": seed,
@@ -320,7 +449,9 @@ def evaluate_fixed_set(
             "agent_load_mean": ep_load / max(1, ep_len),
             "oracle_min_load_sum": oracle_min_load_sum,
             "oracle_min_energy_sum": oracle_min_energy_sum,
-            "oracle_shortest_len": oracle_shortest_len
+            "oracle_shortest_len": oracle_shortest_len,
+            "detour": ep_len - oracle_shortest_len,
+            "feasible": feasible,
         })
 
     df = pd.DataFrame(results)
@@ -329,6 +460,8 @@ def evaluate_fixed_set(
     print("\n========== Fixed Set Evaluation Report ==========")
     print(f"Success Rate: {df['success'].mean():.2%}")
     print(f"Avg Length: {df['ep_len'].mean():.2f} (Oracle Shortest: {df['oracle_shortest_len'].mean():.2f})")
+    if 'feasible' in df.columns:
+        print(f"Feasible Rate: {df['feasible'].mean():.2%}")
     print("-" * 30)
     print("Energy (Episode Sum):")
     print(f"  Agent:  {df['agent_energy_sum'].mean():.4f}")
@@ -345,6 +478,28 @@ def evaluate_fixed_set(
     if out_csv:
         df.to_csv(out_csv, index=False)
         print(f"\n[INFO] Results saved to {out_csv}")
+
+    if record_outputs:
+        total_visits = visit_counts.sum()
+        visit_prob = (visit_counts / total_visits) if total_visits > 0 else np.zeros_like(visit_counts, dtype=np.float64)
+        if out_npz:
+            np.savez(
+                out_npz,
+                visit_counts=visit_counts,
+                visit_prob=visit_prob,
+                visit_energy_counts=visit_energy_counts,
+                visit_load_counts=visit_load_counts,
+                grid_size=grid_size,
+            )
+            print(f"[INFO] Visit heatmap saved to {out_npz}")
+        if save_trajectory_json:
+            serializable = [
+                {"seed": k, "traj": v}
+                for k, v in sorted(trajectory_records.items())
+            ]
+            with open(save_trajectory_json, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, ensure_ascii=False, indent=2)
+            print(f"[INFO] Trajectories saved to {save_trajectory_json}")
     
     return df
 
@@ -365,7 +520,7 @@ def parse_args():
         help="Starting seed for evaluation"
     )
     parser.add_argument(
-        "--deterministic", action="store_true",
+        "--deterministic", type=_str2bool, nargs="?", const=True, default=False,
         help="Use deterministic policy (greedy) instead of stochastic"
     )
     parser.add_argument(
@@ -384,19 +539,19 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=256)
     parser.add_argument("--congestion_pattern", type=str, default="block")
     parser.add_argument("--congestion_density", type=float, default=0.40)
-    parser.add_argument("--energy_high_cost", type=float, default=3.0)
     parser.add_argument("--energy_high_density", type=float, default=0.20)
     parser.add_argument("--patch_radius", type=int, default=2)
+    parser.add_argument("--record_trajectory", type=_str2bool, nargs="?", const=True, default=False)
+    parser.add_argument("--out_npz", type=str, default=None)
+    parser.add_argument("--save_trajectory_json", type=str, default=None)
+    parser.add_argument("--start_goal_mode", type=str, default=None)
+    parser.add_argument("--start_rect", type=str, default=None)
+    parser.add_argument("--goal_rect", type=str, default=None)
     
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-
-    cfg_for_log = load_config_from_dir(args.ckpt_path)
-    scale_for_log = cfg_for_log.get("load_cost_scale", 1.0)
-    print(f"[INFO] load_cost_scale from config: {scale_for_log} (will be passed into env)")
-    print("[INFO] Oracle cost uses load_cost_scale inside get_oracle_cost: YES")
     
     evaluate_fixed_set(
         model_path=args.ckpt_path,
@@ -411,7 +566,12 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         congestion_pattern=args.congestion_pattern,
         congestion_density=args.congestion_density,
-        energy_high_cost=args.energy_high_cost,
         energy_high_density=args.energy_high_density,
         patch_radius=args.patch_radius,
+        start_goal_mode=args.start_goal_mode,
+        start_rect=_parse_rect(args.start_rect),
+        goal_rect=_parse_rect(args.goal_rect),
+        record_trajectory=args.record_trajectory,
+        out_npz=args.out_npz,
+        save_trajectory_json=args.save_trajectory_json,
     )
