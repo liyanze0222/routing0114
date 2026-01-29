@@ -2,6 +2,7 @@
 grid_energy_obs_wrapper.py
 
 在原始观测后拼接一个以 agent 为中心的 energy patch，帮助策略理解局部能耗分布。
+energy_map 已经是二值 0/1，直接输出无需归一化。
 """
 
 from __future__ import annotations
@@ -16,19 +17,17 @@ from grid_env import GridRoutingEnv
 
 
 class GridEnergyObsWrapper(gym.ObservationWrapper):
-    """将能耗 patch 拼接到观测末尾，可选归一化。"""
+    """将能耗 patch 拼接到观测末尾，energy_map 已经是 0/1 无需归一化。"""
 
     def __init__(
         self,
         env: gym.Env,
         patch_radius: int = 1,
-        normalize: bool = True,
+        normalize: bool = False,  # 保留参数但忽略，energy_map 已是 0/1
     ):
         super().__init__(env)
         self.patch_radius = int(patch_radius)
-        self.normalize = bool(normalize)
         self.patch_size = (2 * self.patch_radius + 1) ** 2
-        self._norm_eps = 1e-8
 
         # 查找包含 energy map 的 wrapper（通常是 GridCostWrapper）
         self._energy_wrapper = find_wrapper_with_attr(env, "_energy_map")
@@ -59,12 +58,10 @@ class GridEnergyObsWrapper(gym.ObservationWrapper):
                 "请检查 wrapper 链。"
             )
 
-        self._energy_base = getattr(self._energy_wrapper, "energy_base", None)
-        self._energy_high = getattr(self._energy_wrapper, "energy_high_cost", None)
-
-        # 更新 observation space
+        # 更新 observation space：energy_map 是 0/1，patch 范围固定 [0, 1]
         orig_space = env.observation_space
-        patch_low, patch_high = self._get_patch_bounds()
+        patch_low = np.zeros(self.patch_size, dtype=np.float32)
+        patch_high = np.ones(self.patch_size, dtype=np.float32)
         self.observation_space = gym.spaces.Box(
             low=np.concatenate([orig_space.low, patch_low]),
             high=np.concatenate([orig_space.high, patch_high]),
@@ -75,45 +72,14 @@ class GridEnergyObsWrapper(gym.ObservationWrapper):
     # 内部工具
     # ------------------------------------------------------------------ #
 
-    def _get_patch_bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        if self.normalize:
-            low = np.zeros(self.patch_size, dtype=np.float32)
-            high = np.ones(self.patch_size, dtype=np.float32)
-            return low, high
-        base = self._energy_base if self._energy_base is not None else 0.0
-        high_val = self._energy_high if self._energy_high is not None else base + 1.0
-        if high_val <= base:
-            high_val = base + 1.0
-        low = np.full(self.patch_size, base, dtype=np.float32)
-        high = np.full(self.patch_size, high_val, dtype=np.float32)
-        return low, high
-
-    def _resolve_bounds(self, energy_map: Optional[np.ndarray]) -> tuple[float, float]:
-        base = self._energy_base
-        high = self._energy_high
-        if base is None and energy_map is not None:
-            base = float(np.min(energy_map))
-        if high is None and energy_map is not None:
-            high = float(np.max(energy_map))
-        if base is None:
-            base = 0.0
-        if high is None or high <= base:
-            high = base + 1.0
-        return base, high
-
-    def _fill_value(self, energy_map: Optional[np.ndarray]) -> float:
-        if self._energy_high is not None:
-            return float(self._energy_high)
-        if energy_map is not None:
-            return float(np.max(energy_map))
-        return 1.0
-
     def _get_energy_patch(self) -> np.ndarray:
+        """获取以当前 agent 位置为中心的 energy patch（0/1 值）。"""
         energy_map = getattr(self._energy_wrapper, "_energy_map", None)
         r, c = self._base_env.agent_row, self._base_env.agent_col
         grid_size = self._base_env.grid_size
         radius = self.patch_radius
-        fill_value = self._fill_value(energy_map)
+        # 越界位置填充 1.0（视为高能耗区域）
+        fill_value = 1.0
 
         values = []
         for dr in range(-radius, radius + 1):
@@ -129,12 +95,6 @@ class GridEnergyObsWrapper(gym.ObservationWrapper):
                     values.append(fill_value)
 
         patch = np.array(values, dtype=np.float32)
-
-        if self.normalize:
-            base, high = self._resolve_bounds(energy_map)
-            scale = max(high - base, self._norm_eps)
-            patch = np.clip((patch - base) / scale, 0.0, 1.0)
-
         return patch
 
     # ------------------------------------------------------------------ #

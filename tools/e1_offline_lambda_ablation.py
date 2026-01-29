@@ -143,12 +143,10 @@ def build_env_from_config(config: Dict) -> GridRoutingEnv:
     )
     env = GridCostWrapper(
         env,
-        energy_base=1.0,
-        energy_high_cost=config.get("energy_high_cost", 3.0),
         energy_high_density=config.get("energy_high_density", 0.2),
         congestion_density=config.get("congestion_density", 0.3),
         congestion_pattern=config.get("congestion_pattern", "random"),
-        load_cost_scale=config.get("load_cost_scale", 1.0),
+        load_threshold=config.get("load_threshold", 0.6),
     )
     env = GridHardWrapper(env)
     if config.get("include_congestion_obs", False):
@@ -157,7 +155,6 @@ def build_env_from_config(config: Dict) -> GridRoutingEnv:
         env = GridEnergyObsWrapper(
             env,
             patch_radius=config.get("energy_patch_radius", 1),
-            normalize=config.get("energy_obs_normalize", True),
         )
     if config.get("obs_rms", False):
         env = GridObsNormWrapper(env)

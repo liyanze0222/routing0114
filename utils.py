@@ -146,6 +146,20 @@ def plot_training_curves(
     def get_col(key):
         return [d.get(key) for d in data if key in d]
 
+    def ema(values, alpha=0.2):
+        """Simple EMA with fallback for missing values."""
+        if not values:
+            return []
+        out = []
+        prev = None
+        for v in values:
+            if v is None:
+                out.append(prev if prev is not None else 0.0)
+                continue
+            prev = v if prev is None else alpha * v + (1 - alpha) * prev
+            out.append(prev)
+        return out
+
     iterations = get_col("iteration")
     avg_returns = get_col("avg_return")
     avg_lengths = get_col("avg_length")
@@ -254,25 +268,38 @@ def plot_training_curves(
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # ========== 6. Loss & Entropy ==========
-    ax = axes[1, 2]
-    if policy_loss:
-        ax.plot(iterations, policy_loss, label="Policy Loss", color="blue")
-    if value_loss:
-        ax.plot(iterations, value_loss, label="Value Loss", color="green")
-    add_best_iter_line(ax)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Loss")
-    ax.set_title("Losses")
-    ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.3)
+    # ========== 6. Loss & Entropy (twin axes) ==========
+    ax_left = axes[1, 2]
+    ax_right = ax_left.twinx()
 
-    # Entropy 在右轴
+    if policy_loss:
+        smoothed_policy = ema(policy_loss, alpha=0.2)
+        ax_left.plot(iterations[:len(smoothed_policy)], smoothed_policy,
+                     label="Policy Loss", color="blue")
+        ax_left.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.6)
+
+    if value_loss:
+        smoothed_value = ema(value_loss, alpha=0.2)
+        ax_right.plot(iterations[:len(smoothed_value)], smoothed_value,
+                      label="Value Loss", color="green")
+
     if entropy:
-        ax2 = ax.twinx()
-        ax2.plot(iterations, entropy, label="Entropy", color="orange", linestyle="--")
-        ax2.set_ylabel("Entropy")
-        ax2.legend(loc="upper right")
+        ax_right.plot(iterations[:len(entropy)], entropy,
+                      label="Entropy (right axis)", color="orange", linestyle="--")
+
+    add_best_iter_line(ax_left)
+    ax_left.set_xlabel("Iteration")
+    ax_left.set_ylabel("Policy loss")
+    ax_right.set_ylabel("Value loss")
+    ax_left.set_title("Losses")
+
+    if policy_loss:
+        ax_left.legend(loc="upper left")
+    handles, labels = ax_right.get_legend_handles_labels()
+    if handles:
+        ax_right.legend(handles, labels, loc="upper right")
+
+    ax_left.grid(True, alpha=0.3)
 
     # ========== 7-9. Gap 和 KKT 残差（仅当有数据时） ==========
     if has_gap_kkt:

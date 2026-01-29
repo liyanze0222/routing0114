@@ -48,14 +48,17 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=256, help="episode 最大步数")
     parser.add_argument("--success_reward", type=float, default=20.0, help="成功奖励")
     
-    parser.add_argument("--energy_high_cost", type=float, default=3.0, help="高能耗区域成本")
     parser.add_argument("--energy_high_density", type=float, default=0.2, help="高能耗区域密度")
     parser.add_argument("--congestion_density", type=float, default=0.3, help="拥塞密度")
     parser.add_argument(
         "--congestion_pattern", type=str, default="random",
         choices=["random", "block"], help="拥塞模式"
     )
-    parser.add_argument("--load_cost_scale", type=float, default=1.0, help="load cost 缩放系数")
+    parser.add_argument("--load_threshold", type=float, default=0.6, help="load cost 的软阈值 τ")
+    parser.add_argument(
+        "--randomize_maps_each_reset", type=lambda x: x.lower() == "true", default=True,
+        help="是否在每次 reset 时重采样能耗/拥塞地图（训练默认 True）"
+    )
     
     # ========== 观测增强 ==========
     parser.add_argument(
@@ -68,10 +71,6 @@ def parse_args():
         help="是否包含能耗观测"
     )
     parser.add_argument("--energy_patch_radius", type=int, default=1, help="能耗 patch 半径")
-    parser.add_argument(
-        "--energy_obs_normalize", type=lambda x: x.lower() == "true", default=True,
-        help="是否归一化能耗观测"
-    )
     
     # ========== Cost Weights (关键参数) ==========
     parser.add_argument(
@@ -114,19 +113,18 @@ def _build_env(args):
     )
     env = GridCostWrapper(
         base_env,
-        energy_base=1.0,
-        energy_high_cost=args.energy_high_cost,
         energy_high_density=args.energy_high_density,
         congestion_density=args.congestion_density,
         congestion_pattern=args.congestion_pattern,
-        load_cost_scale=args.load_cost_scale,
+        load_threshold=args.load_threshold,
+        randomize_maps_each_reset=args.randomize_maps_each_reset,
     )
     env = GridHardWrapper(env)
     if args.include_congestion_obs:
         env = GridCongestionObsWrapper(env, patch_radius=args.congestion_patch_radius)
     if args.include_energy_obs:
         env = GridEnergyObsWrapper(
-            env, patch_radius=args.energy_patch_radius, normalize=args.energy_obs_normalize
+            env, patch_radius=args.energy_patch_radius
         )
     return env
 
@@ -163,7 +161,7 @@ def main():
     print(f"Max steps: {args.max_steps if args.max_steps > 0 else 4 * args.grid_size ** 2}")
     print(f"Energy weight α: {args.energy_weight}")
     print(f"Load weight β: {args.load_weight}")
-    print(f"Load cost scale: {args.load_cost_scale}")
+    print(f"Load threshold: {args.load_threshold}")
     print("=" * 40 + "\n")
     
     # 设备
@@ -206,6 +204,7 @@ def main():
     # 初始 reset
     obs, info = env.reset(seed=args.seed)
     action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+    current_map_fingerprint = info.get("map_fingerprint")
     
     # 训练循环
     ep_ret = 0.0
@@ -220,6 +219,9 @@ def main():
     print("=" * 70 + "\n")
     
     for iteration in range(1, args.total_iters + 1):
+        map_fingerprints_iter: List[str] = []
+        if current_map_fingerprint is not None:
+            map_fingerprints_iter.append(current_map_fingerprint)
         # Rollout
         for _ in range(config.batch_size):
             # 选择动作
@@ -269,11 +271,17 @@ def main():
                 # Reset
                 obs, info = env.reset()
                 action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+                current_map_fingerprint = info.get("map_fingerprint", current_map_fingerprint)
+                if current_map_fingerprint is not None:
+                    map_fingerprints_iter.append(current_map_fingerprint)
                 ep_ret = 0.0
                 ep_len = 0
                 ep_energy = 0.0
                 ep_load = 0.0
         
+        env_map_changes = len(set(map_fingerprints_iter)) if map_fingerprints_iter else 0
+        last_map_fingerprint = map_fingerprints_iter[-1] if map_fingerprints_iter else None
+
         # 计算 GAE
         advantages, returns = agent.compute_gae(obs, False, action_mask)
         
@@ -319,7 +327,11 @@ def main():
                 "approx_kl": metrics.get("approx_kl", 0.0),
                 "energy_weight": args.energy_weight,
                 "load_weight": args.load_weight,
+                "env_map_changes": env_map_changes,
             }
+
+            if last_map_fingerprint is not None:
+                log_entry["env_map_fingerprint"] = last_map_fingerprint
 
             for key in [
                 "actor_param_delta_l2",

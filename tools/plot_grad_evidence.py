@@ -2,10 +2,11 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
 
 ITER_KEYS = ["iter", "iteration", "update", "update_idx"]
@@ -145,12 +146,159 @@ def maybe_plot(values: Dict[str, Optional[List[float]]], keys: Iterable[str]) ->
     return usable
 
 
+def _ema(series: pd.Series, alpha: float = 0.2) -> pd.Series:
+    return series.ewm(alpha=alpha, adjust=False).mean()
+
+
+def _pick_col(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    for k in candidates:
+        if k in df.columns:
+            return k
+    return None
+
+
+def _percent(condition: pd.Series) -> float:
+    total = condition.shape[0]
+    if total == 0:
+        return float("nan")
+    return 100.0 * condition.sum() / total
+
+
+def _format_stats(stats: Dict[str, float], tail_start: int, n: int) -> str:
+    lines = [
+        f"tail >= {tail_start} (n={n})",
+        f"g_c_over_r  mean={stats['g_c_over_r_mean']:.3f}  med={stats['g_c_over_r_median']:.3f}  >1={stats['g_c_over_r_gt1_pct']:.1f}%",
+        f"cos_total_c mean={stats['cos_total_c_mean']:.3f}  med={stats['cos_total_c_median']:.3f}  >0.8={stats['cos_total_c_gt08_pct']:.1f}%",
+        f"actor_param_delta_ratio mean={stats['apdr_mean']:.3f}  med={stats['apdr_median']:.3f}  >0={stats['apdr_gt0_pct']:.1f}%",
+    ]
+    return "\n".join(lines)
+
+
+def plot_grad_domination_curves(metrics_path: Union[str, Path], out_path: Optional[Union[str, Path]], tail_start: int = 150):
+    """Plot whether penalty dominates updates across training iterations.
+
+    Args:
+        metrics_path: Path to metrics.json (list of dict).
+        out_path: Output directory for figures and stats; defaults to metrics directory.
+        tail_start: Iteration threshold used for tail zoom and statistics.
+    """
+
+    metrics_path = Path(metrics_path)
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"Metrics file not found: {metrics_path}")
+
+    records = load_metrics(metrics_path)
+    if not records:
+        raise ValueError("metrics file is empty")
+
+    df = pd.DataFrame(records)
+    iter_col = _pick_col(df, ITER_KEYS) or "iteration"
+    if iter_col not in df.columns:
+        df[iter_col] = np.arange(len(df))
+    df[iter_col] = pd.to_numeric(df[iter_col], errors="coerce")
+    df = df.dropna(subset=[iter_col]).sort_values(iter_col)
+
+    field_map = {
+        "g_c_over_r": G_C_OVER_R_KEYS,
+        "cos_total_c": COS_TOTAL_C_KEYS,
+        "actor_param_delta_ratio": PARAM_DELTA_RATIO_KEYS,
+    }
+
+    series: Dict[str, pd.Series] = {}
+    missing: List[str] = []
+    for name, candidates in field_map.items():
+        col = _pick_col(df, candidates)
+        if col is None:
+            missing.append(name)
+            continue
+        series[name] = pd.to_numeric(df[col], errors="coerce")
+
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
+
+    out_dir = Path(out_path) if out_path is not None else metrics_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tail_df = df[df[iter_col] >= tail_start]
+    if tail_df.empty:
+        tail_df = df.copy()
+
+    stats = {
+        "g_c_over_r_mean": float(series["g_c_over_r"].loc[tail_df.index].mean()),
+        "g_c_over_r_median": float(series["g_c_over_r"].loc[tail_df.index].median()),
+        "g_c_over_r_gt1_pct": _percent(series["g_c_over_r"].loc[tail_df.index] > 1.0),
+        "cos_total_c_mean": float(series["cos_total_c"].loc[tail_df.index].mean()),
+        "cos_total_c_median": float(series["cos_total_c"].loc[tail_df.index].median()),
+        "cos_total_c_gt08_pct": _percent(series["cos_total_c"].loc[tail_df.index] > 0.8),
+        "apdr_mean": float(series["actor_param_delta_ratio"].loc[tail_df.index].mean()),
+        "apdr_median": float(series["actor_param_delta_ratio"].loc[tail_df.index].median()),
+        "apdr_gt0_pct": _percent(series["actor_param_delta_ratio"].loc[tail_df.index] > 0.0),
+        "tail_count": int(tail_df.shape[0]),
+        "tail_start": int(tail_start),
+    }
+
+    def _plot(df_slice: pd.DataFrame, suffix: str, title_prefix: str, annotate: bool = True):
+        fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+
+        x_vals = df_slice[iter_col]
+        curves = {
+            "g_c_over_r": (series["g_c_over_r"].loc[df_slice.index], 1.0, None),
+            "cos_total_c": (series["cos_total_c"].loc[df_slice.index], 0.8, (-0.1, 1.05)),
+            "actor_param_delta_ratio": (series["actor_param_delta_ratio"].loc[df_slice.index], 0.0, None),
+        }
+
+        for ax, (name, (vals, hline, ylim)) in zip(axes, curves.items()):
+            ema_vals = _ema(vals, alpha=0.2)
+            ax.plot(x_vals, vals, label=f"{name} (raw)", alpha=0.4)
+            ax.plot(x_vals, ema_vals, label=f"{name} (EMA)", linewidth=1.8)
+            ax.axhline(hline, color="gray", linestyle="--", linewidth=1)
+            if ylim:
+                ax.set_ylim(*ylim)
+            ax.set_ylabel(name)
+            ax.grid(True, alpha=0.4)
+            ax.legend(loc="best")
+
+        axes[-1].set_xlabel(iter_col)
+        fig.suptitle(f"{title_prefix} grad domination")
+
+        if annotate:
+            fig.text(
+                0.98,
+                0.02,
+                _format_stats(stats, tail_start=tail_start, n=stats["tail_count"]),
+                ha="right",
+                va="bottom",
+                fontsize=9,
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="gray"),
+            )
+
+        fig.tight_layout(rect=[0, 0.03, 1, 0.98])
+        out_file = out_dir / f"grad_domination_{suffix}.png"
+        fig.savefig(out_file, dpi=200)
+        plt.close(fig)
+
+    _plot(df, "full", "Full", annotate=True)
+    _plot(tail_df, "tail", f"Tail (>= {tail_start})", annotate=True)
+
+    stats_path = out_dir / "grad_domination_tail_stats.json"
+    stats_to_dump = {k: (None if isinstance(v, float) and np.isnan(v) else v) for k, v in stats.items()}
+    stats_path.write_text(json.dumps(stats_to_dump, indent=2), encoding="utf-8")
+
+    return {
+        "full_png": str(out_dir / "grad_domination_full.png"),
+        "tail_png": str(out_dir / "grad_domination_tail.png"),
+        "stats_json": str(stats_path),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot gradient evidence figures from metrics.json")
     parser.add_argument("--metrics_path", type=str, default="metrics.json", help="Path to metrics file (JSON or JSONL)")
     parser.add_argument("--out_dir", type=str, default=None, help="Output directory for plots (default: same as metrics)")
     parser.add_argument("--smooth_window", type=int, default=1, help="Smoothing window size (sliding mean), 1=disabled")
     parser.add_argument("--every_k", type=int, default=1, help="Downsample factor, plot every k points")
+    parser.add_argument("--plot_grad_domination", action="store_true", help="Generate grad domination figures/stats")
+    parser.add_argument("--tail_start", type=int, default=150, help="Iteration threshold for tail zoom/stats")
     args = parser.parse_args()
 
     metrics_path = Path(args.metrics_path)
@@ -189,6 +337,9 @@ def main():
 
     out_dir = Path(args.out_dir) if args.out_dir else metrics_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.plot_grad_domination:
+        plot_grad_domination_curves(metrics_path, out_dir, tail_start=args.tail_start)
 
     def process_series(data: List[float]) -> List[float]:
         data = smooth(data, max(1, args.smooth_window))

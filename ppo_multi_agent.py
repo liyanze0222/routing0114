@@ -194,7 +194,7 @@ class MultiCriticPPO:
     核心逻辑：
     - 使用 MultiHeadActorCritic 网络（一个 reward value head + 多个 cost value head）
     - 对 reward 和每个 cost 分别计算 GAE
-    - 策略优势使用拉格朗日加权：adv_eff = adv_reward - Σ λ_k * adv_cost_k
+    - 策略优势：reward 与 cost surrogate 分离（hinge on positive cost adv）；CMDP PPO-Lagrangian split surrogate
     - λ 更新：λ_k ← max(0, λ_k + λ_lr * (avg_cost_k - budget_k))
     """
 
@@ -540,73 +540,54 @@ class MultiCriticPPO:
                 torch.linalg.norm(actor_param_before).item() if actor_param_before.numel() > 0 else 0.0
             )
 
-        # ========== 3. 构造有效优势 adv_eff ==========
+        # ========== 3. 分离 reward / cost 优势，用于分裂 surrogate ==========
+        adv_reward_norm = self._normalize_advantage(adv_reward)
+        adv_reward_t = torch.as_tensor(adv_reward_norm, dtype=torch.float32, device=self.device)
+
         if self.is_aggregated_mode:
-            # aggregated 模式：adv_eff = adv_reward - lambda_total * adv_cost_total
-            lambda_total = self.lambdas.get("energy", 0.0)  # 复用 "energy" key 存储 lambda_total
-            adv_eff_raw = adv_reward - lambda_total * adv_cost_total
             adv_energy_raw = adv_cost_total
             adv_load_raw = np.zeros_like(adv_reward, dtype=np.float32)
         else:
-            # separate 模式：adv_eff = adv_reward - Σ λ_k * adv_cost_k
-            adv_eff_raw = adv_reward.copy()
-            for name in self.cost_names:
-                adv_eff_raw -= self.lambdas[name] * adv_costs[name]
             adv_energy_raw = adv_costs.get("energy", np.zeros_like(adv_reward, dtype=np.float32))
             adv_load_raw = adv_costs.get("load", np.zeros_like(adv_reward, dtype=np.float32))
-        
-        adv_eff = self._normalize_advantage(adv_eff_raw)
 
-        # Advantage diagnostics (use normalized advantages aligned with actor loss)
+        adv_energy_t = torch.as_tensor(adv_energy_raw, dtype=torch.float32, device=self.device)
+        adv_load_t = torch.as_tensor(adv_load_raw, dtype=torch.float32, device=self.device)
+
+        update_lambdas = bool(getattr(self.cfg, "update_lambdas", False))
+
+        # 统一记录有效开关
+        self.cfg.update_lambdas = update_lambdas
+        has_cost_adv = (adv_energy_t.numel() > 0) or (adv_load_t.numel() > 0)
+
+        # penalty 生效条件：自适应 λ 或已有 λ>0
+        use_penalty_terms = update_lambdas or any(v > 0 for v in self.lambdas.values())
+        use_cost_terms = use_penalty_terms and has_cost_adv
+        use_lagrange = update_lambdas  # 兼容旧日志字段
+
+        # Advantage diagnostics aligned with the split surrogate.
         adv_penalty_metrics: Dict[str, float] = {}
         lambdaA_metrics: Dict[str, float] = {}
         with torch.no_grad():
-            adv_reward_norm = torch.as_tensor(
-                self._normalize_advantage(adv_reward), dtype=torch.float32, device=self.device
-            )
-            if self.is_aggregated_mode:
-                adv_cost_total_norm = torch.as_tensor(
-                    self._normalize_advantage(adv_cost_total), dtype=torch.float32, device=self.device
-                )
-                lambda_energy = self.lambdas.get("energy", 0.0)
-                adv_penalty = lambda_energy * adv_cost_total_norm
-                lambdaA_total = (lambda_energy * adv_cost_total_norm).abs().mean().item()
-                lambdaA_metrics = {
-                    "lambdaA_energy_abs_mean": 0.0,
-                    "lambdaA_load_abs_mean": 0.0,
-                    "lambdaA_total_abs_mean": lambdaA_total,
-                }
-            else:
-                adv_energy_norm = torch.as_tensor(
-                    self._normalize_advantage(adv_costs.get("energy", np.zeros_like(adv_reward))),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                adv_load_norm = torch.as_tensor(
-                    self._normalize_advantage(adv_costs.get("load", np.zeros_like(adv_reward))),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                lambda_energy = self.lambdas.get("energy", 0.0)
-                lambda_load = self.lambdas.get("load", 0.0)
-                adv_penalty = lambda_energy * adv_energy_norm + lambda_load * adv_load_norm
+            lambda_energy = self.lambdas.get("energy", 0.0)
+            lambda_load = self.lambdas.get("load", 0.0)
 
-                penalty_adv_energy = (lambda_energy * adv_energy_norm).abs().mean().item()
-                penalty_adv_load = (lambda_load * adv_load_norm).abs().mean().item()
-                lambdaA_metrics = {
-                    "lambdaA_energy_abs_mean": penalty_adv_energy,
-                    "lambdaA_load_abs_mean": penalty_adv_load,
-                    "lambdaA_total_abs_mean": (lambda_energy * adv_energy_norm + lambda_load * adv_load_norm).abs().mean().item(),
-                }
+            adv_penalty = lambda_energy * adv_energy_t + lambda_load * adv_load_t
 
-            adv_reward_abs_mean = adv_reward_norm.abs().mean().item()
+            adv_reward_abs_mean = adv_reward_t.abs().mean().item()
             adv_penalty_abs_mean = adv_penalty.abs().mean().item()
             adv_penalty_metrics = {
                 "adv_reward_abs_mean": adv_reward_abs_mean,
                 "adv_penalty_abs_mean": adv_penalty_abs_mean,
                 "adv_penalty_to_reward_ratio": adv_penalty_abs_mean / (adv_reward_abs_mean + 1e-8),
-                "adv_reward_mean": adv_reward_norm.mean().item(),
+                "adv_reward_mean": adv_reward_t.mean().item(),
                 "adv_penalty_mean": adv_penalty.mean().item(),
+            }
+
+            lambdaA_metrics = {
+                "lambdaA_energy_abs_mean": (lambda_energy * adv_energy_t).abs().mean().item(),
+                "lambdaA_load_abs_mean": (lambda_load * adv_load_t).abs().mean().item(),
+                "lambdaA_total_abs_mean": adv_penalty.abs().mean().item(),
             }
 
         # 梯度分解（A2）开关：默认关闭，仅当满足间隔时计算
@@ -630,56 +611,37 @@ class MultiCriticPPO:
             return torch.cat(flat_parts)
 
         actor_decomp_enabled = bool(self.cfg.log_actor_decomp)
-        actor_decomp_tensors: Dict[str, torch.Tensor] = {}
+        actor_decomp_tensors: Dict[str, torch.Tensor] = {
+            "adv_r": adv_reward_t,
+            "adv_energy": adv_energy_t,
+            "adv_load": adv_load_t,
+        }
         actor_decomp_stats: Dict[str, float] = {}
         total_pg_r_like = 0.0
         total_pg_p_like = 0.0
+        total_pg_c_e_like = 0.0
+        total_pg_c_l_like = 0.0
         decomp_update_steps = 0
 
         if actor_decomp_enabled:
-            eps = 1e-8
-            adv_eff_mean = float(np.mean(adv_eff_raw))
-            adv_eff_std = float(np.std(adv_eff_raw) + eps)
-
-            # 将 reward/cost 优势投影到与 actor loss 一致的归一化尺度
-            adv_r_like = (adv_reward - adv_eff_mean) / adv_eff_std
-            adv_energy_like = adv_energy_raw / adv_eff_std
-            adv_load_like = adv_load_raw / adv_eff_std
-
             lambda_energy = self.lambdas.get("energy", 0.0)
             lambda_load = self.lambdas.get("load", 0.0)
-            penalty_like = lambda_energy * adv_energy_like + lambda_load * adv_load_like
-
-            adv_r_t = torch.as_tensor(adv_r_like, dtype=torch.float32, device=self.device)
-            adv_energy_t = torch.as_tensor(adv_energy_like, dtype=torch.float32, device=self.device)
-            adv_load_t = torch.as_tensor(adv_load_like, dtype=torch.float32, device=self.device)
-            penalty_t = torch.as_tensor(penalty_like, dtype=torch.float32, device=self.device)
-
-            actor_decomp_tensors = {
-                "adv_r": adv_r_t,
-                "adv_energy": adv_energy_t,
-                "adv_load": adv_load_t,
-                "penalty": penalty_t,
-            }
-
             with torch.no_grad():
+                penalty_t = lambda_energy * actor_decomp_tensors["adv_energy"] + lambda_load * actor_decomp_tensors["adv_load"]
                 actor_decomp_stats = {
-                    "adv_r_mean": adv_r_t.mean().item(),
-                    "adv_r_std": adv_r_t.std().item(),
-                    "adv_energy_mean": adv_energy_t.mean().item(),
-                    "adv_energy_std": adv_energy_t.std().item(),
-                    "adv_load_mean": adv_load_t.mean().item(),
-                    "adv_load_std": adv_load_t.std().item(),
+                    "adv_r_mean": actor_decomp_tensors["adv_r"].mean().item(),
+                    "adv_r_std": actor_decomp_tensors["adv_r"].std().item(),
+                    "adv_energy_mean": actor_decomp_tensors["adv_energy"].mean().item(),
+                    "adv_energy_std": actor_decomp_tensors["adv_energy"].std().item(),
+                    "adv_load_mean": actor_decomp_tensors["adv_load"].mean().item(),
+                    "adv_load_std": actor_decomp_tensors["adv_load"].std().item(),
                     "lambda_energy": lambda_energy,
                     "lambda_load": lambda_load,
                     "penalty_mean": penalty_t.mean().item(),
                     "penalty_abs_mean": penalty_t.abs().mean().item(),
-                    "adv_eff_mean": float(np.mean(adv_eff)),
-                    "adv_eff_std": float(np.std(adv_eff)),
                 }
 
         # 转换为 tensor
-        adv_eff_t = torch.as_tensor(adv_eff, dtype=torch.float32, device=self.device)
         ret_reward_t = torch.as_tensor(ret_reward, dtype=torch.float32, device=self.device)
         
         if self.is_aggregated_mode:
@@ -720,8 +682,14 @@ class MultiCriticPPO:
                 mb_actions = actions[mb_idx]
                 mb_old_log_probs = old_log_probs[mb_idx]
                 mb_action_masks = action_masks[mb_idx]
-                mb_adv_eff = adv_eff_t[mb_idx]
+                mb_adv_r = adv_reward_t[mb_idx]
+                mb_adv_energy = adv_energy_t[mb_idx]
+                mb_adv_load = adv_load_t[mb_idx]
                 mb_ret_reward = ret_reward_t[mb_idx]
+
+                if not use_cost_terms:
+                    mb_adv_energy = torch.zeros_like(mb_adv_energy)
+                    mb_adv_load = torch.zeros_like(mb_adv_load)
                 
                 # aggregated 模式：使用 ret_cost_total_t；separate 模式：使用 ret_costs_t
                 if self.is_aggregated_mode:
@@ -753,19 +721,11 @@ class MultiCriticPPO:
 
                 # 梯度分解与 cosine（A2）：仅在开启且满足间隔时计算一次
                 if should_log_grad_decomp and not grad_decomp_metrics:
-                    mb_adv_r = adv_reward_norm[mb_idx]
-                    if self.is_aggregated_mode:
-                        mb_adv_energy = adv_cost_total_norm[mb_idx]
-                        mb_adv_load = torch.zeros_like(mb_adv_energy)
-                    else:
-                        mb_adv_energy = adv_energy_norm[mb_idx]
-                        mb_adv_load = adv_load_norm[mb_idx]
-
                     lambda_energy_cur = self.lambdas.get("energy", 0.0)
                     lambda_load_cur = self.lambdas.get("load", 0.0)
-                    penalty_mb = lambda_energy_cur * mb_adv_energy + lambda_load_cur * mb_adv_load
 
                     loss_r = -torch.min(ratio * mb_adv_r, ratio_clipped * mb_adv_r).mean()
+                    penalty_mb = lambda_energy_cur * mb_adv_energy + lambda_load_cur * mb_adv_load
                     loss_c = torch.min(ratio * penalty_mb, ratio_clipped * penalty_mb).mean()
                     loss_total = loss_r + loss_c
 
@@ -803,19 +763,32 @@ class MultiCriticPPO:
                         "cos_total_c": cos_total_c,
                     }
 
-                surr1 = ratio * mb_adv_eff
-                surr2 = ratio_clipped * mb_adv_eff
-                policy_loss = -torch.min(surr1, surr2).mean()
+                # ===== Split surrogate for CMDP PPO-Lagrangian =====
+                obj_r = torch.min(ratio * mb_adv_r, ratio_clipped * mb_adv_r)
 
-                if actor_decomp_enabled:
-                    with torch.no_grad():
-                        mb_adv_r = actor_decomp_tensors["adv_r"][mb_idx]
-                        mb_penalty = actor_decomp_tensors["penalty"][mb_idx]
-                        pg_loss_r_like = -torch.min(ratio * mb_adv_r, ratio_clipped * mb_adv_r).mean()
-                        pg_loss_p_like = torch.min(ratio * mb_penalty, ratio_clipped * mb_penalty).mean()
-                        total_pg_r_like += pg_loss_r_like.item()
-                        total_pg_p_like += pg_loss_p_like.item()
-                        decomp_update_steps += 1
+                obj_c_e_mean = torch.tensor(0.0, device=self.device)
+                obj_c_l_mean = torch.tensor(0.0, device=self.device)
+                if use_cost_terms:
+                    if mb_adv_energy.numel() > 0:
+                        obj_c_e = torch.min(ratio * mb_adv_energy, ratio_clipped * mb_adv_energy)
+                        obj_c_e_mean = obj_c_e.mean()
+                    if mb_adv_load.numel() > 0:
+                        obj_c_l = torch.min(ratio * mb_adv_load, ratio_clipped * mb_adv_load)
+                        obj_c_l_mean = obj_c_l.mean()
+
+                lambda_energy_cur = self.lambdas.get("energy", 0.0)
+                lambda_load_cur = self.lambdas.get("load", 0.0)
+                pg_loss_r = -obj_r.mean()
+                pg_loss_c_e = lambda_energy_cur * obj_c_e_mean
+                pg_loss_c_l = lambda_load_cur * obj_c_l_mean
+                actor_loss = pg_loss_r + pg_loss_c_e + pg_loss_c_l - self.cfg.ent_coef * entropy.mean()
+
+                # Metrics accumulation (always on for clarity)
+                total_pg_r_like += pg_loss_r.item()
+                total_pg_p_like += (pg_loss_c_e + pg_loss_c_l).item()
+                total_pg_c_e_like += obj_c_e_mean.item()
+                total_pg_c_l_like += obj_c_l_mean.item()
+                decomp_update_steps += 1
 
                 # ===== Value Loss =====
                 # reward value loss
@@ -844,11 +817,8 @@ class MultiCriticPPO:
                         value_loss = value_loss_reward
 
                 # ===== 总损失 =====
-                loss = (
-                    policy_loss
-                    + self.cfg.value_coef * value_loss
-                    - self.cfg.ent_coef * entropy.mean()
-                )
+                # actor_loss already包含 entropy term
+                loss = actor_loss + self.cfg.value_coef * value_loss
 
                 # 反向传播
                 self.optimizer.zero_grad()
@@ -856,7 +826,7 @@ class MultiCriticPPO:
                 clip_grad_norm_(self.network.parameters(), self.cfg.max_grad_norm)
                 self.optimizer.step()
 
-                total_policy_loss += policy_loss.item()
+                total_policy_loss += actor_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy += entropy.mean().item()
                 update_steps += 1
@@ -955,7 +925,7 @@ class MultiCriticPPO:
         corr_gap_for_log = 0.0
         precond_diag: Dict[str, float] = {}
 
-        if self.cfg.update_lambdas:
+        if update_lambdas:
             # D2: 检查是否到达更新频率
             should_update_lambda = (self._iter_count % self.cfg.lambda_update_freq == 0)
 
@@ -1159,18 +1129,33 @@ class MultiCriticPPO:
                 # hysteresis 更新（hysteresis 或 both）
                 if should_update_lambda:
                     for name in self.cost_names:
-                        # 获取基础 lr（保持与旧逻辑一致的优先级）
-                        if self.cfg.lambda_lrs is not None:
-                            base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                        # 改法2：per-cost lr，优先 lambda_lr_energy/lambda_lr_load
+                        if name == "energy":
+                            base_lr = getattr(self.cfg, "lambda_lr_energy", None)
                         else:
-                            base_lr = self.cfg.lambda_lr
+                            base_lr = getattr(self.cfg, "lambda_lr_load", None)
+                        
+                        if base_lr is None:
+                            if self.cfg.lambda_lrs is not None:
+                                base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                            else:
+                                base_lr = self.cfg.lambda_lr
 
                         # hysteresis 分支
                         if self.cfg.dual_update_mode in ("hysteresis", "both"):
-                            g_val = dual_source.get(name, dual_gbar[name])
-                            if abs(g_val) <= self.cfg.dual_deadband:
-                                gap_used_for_update[name] = 0.0
-                                continue
+                            # 改法1：正向用 raw gap，负向用 EMA
+                            g_raw = float(gap_for_mode.get(name, 0.0))
+                            g_ema = dual_source.get(name, dual_gbar[name])
+                            
+                            if g_raw > 0:
+                                # 超预算时：直接用 raw gap，不经过 deadband
+                                g_val = g_raw
+                            else:
+                                # 可行/富余时：用 EMA + deadband 慢下降
+                                g_val = g_ema
+                                if abs(g_val) <= self.cfg.dual_deadband:
+                                    gap_used_for_update[name] = 0.0
+                                    continue
 
                             lr_up = self.cfg.lambda_lr_up if self.cfg.lambda_lr_up is not None else base_lr
                             step_lr = lr_up if g_val > 0 else lr_up * self.cfg.dual_lr_down_scale
@@ -1190,74 +1175,41 @@ class MultiCriticPPO:
                     # 未到更新频率，日志仍保留 gbar 与 corr
                     gap_used_for_update.update({name: 0.0 for name in self.cost_names})
 
-            # ====== standard 模式（原逻辑保持不变） ======
+            # ====== standard 模式：projected dual ascent（不使用 EMA，直接用 raw gap）======
             else:
                 if should_update_lambda:
                     for name in self.cost_names:
-                        budget = self.cfg.cost_budgets.get(name, 0.0)
-                        raw_gap = avg_costs[name] - budget
-                        gap_for_update = (
-                            ratio_gaps[name]
-                            if self.cfg.lambda_gap_mode == "ratio"
-                            else raw_gap
+                        g_raw = float(gap_for_mode.get(name, 0.0))
+                        
+                        # standard 模式不使用 EMA，直接用 raw gap 更新
+                        g_used = g_raw
+
+                        # per-cost lr：优先 lambda_lr_energy / lambda_lr_load，再回退到已有逻辑
+                        if name == "energy":
+                            lr = getattr(self.cfg, "lambda_lr_energy", None)
+                        else:
+                            lr = getattr(self.cfg, "lambda_lr_load", None)
+
+                        if lr is None:
+                            if self.cfg.lambda_lrs is not None:
+                                lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                            else:
+                                lr = self.cfg.lambda_lr
+
+                        new_lambda = max(
+                            0.0,
+                            float(self.lambdas.get(name, 0.0)) + float(lr) * float(g_used),
                         )
-                        # D1: EMA 平滑（lambda_gap_ema_beta > 0 时启用）
-                        if self.cfg.lambda_gap_ema_beta > 0:
-                            beta = self.cfg.lambda_gap_ema_beta
-                            self.ema_gaps[name] = (1 - beta) * self.ema_gaps[name] + beta * gap_for_update
-                            effective_gap = self.ema_gaps[name]
-                        else:
-                            effective_gap = gap_for_update
-
-                        gap_ema_for_log[name] = effective_gap
-
-                        # D3/D7/D8: dead-zone（支持 per-cost、全局、非对称）
-                        # 基础 deadzone：优先 per-cost，回退到全局
-                        deadzone = self.cfg.lambda_deadzone
-                        if self.cfg.lambda_deadzones is not None:
-                            deadzone = self.cfg.lambda_deadzones.get(name, self.cfg.lambda_deadzone)
-
-                        # D8: 非对称 deadzone（覆盖基础 deadzone）
-                        # gap > 0 时使用 lambda_deadzone_up，gap < 0 时使用 lambda_deadzone_down
-                        if effective_gap > 0 and self.cfg.lambda_deadzone_up is not None:
-                            deadzone = self.cfg.lambda_deadzone_up
-                        elif effective_gap < 0 and self.cfg.lambda_deadzone_down is not None:
-                            deadzone = self.cfg.lambda_deadzone_down
-
-                        if deadzone > 0 and abs(effective_gap) < deadzone:
-                            effective_gap = 0.0
-
-                        # 获取该 cost 的 lr：优先 lambda_lrs[name]，回退到 lambda_lr
-                        if self.cfg.lambda_lrs is not None:
-                            base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
-                        else:
-                            base_lr = self.cfg.lambda_lr
-
-                        # D5-D6: 非对称学习率（Asymmetric LR）
-                        # gap > 0: 使用 lambda_lr_up（若设置）
-                        # gap < 0: 使用 lambda_lr_down（若设置）
-                        if effective_gap > 0 and self.cfg.lambda_lr_up is not None:
-                            lr = self.cfg.lambda_lr_up
-                        elif effective_gap < 0 and self.cfg.lambda_lr_down is not None:
-                            lr = self.cfg.lambda_lr_down
-                        else:
-                            lr = base_lr
-
-                        # λ_k ← max(0, λ_k + lr * effective_gap)
-                        new_lambda = max(0.0, self.lambdas[name] + lr * effective_gap)
-
-                        # D4: lambda_max clamp（若设置）
                         if self.cfg.lambda_max is not None:
-                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+                            new_lambda = min(new_lambda, float(self.cfg.lambda_max))
 
                         self.lambdas[name] = new_lambda
-                        gap_used_for_update[name] = effective_gap
+                        gap_used_for_update[name] = float(g_used)
+                        gap_ema_for_log[name] = float(g_used)  # standard 模式下 EMA 等于 raw
                 else:
-                    # 未到更新频率：记录 EMA 或原 gap 用于日志
+                    # 未到更新频率
                     for name in self.cost_names:
-                        gap_ema_for_log[name] = (
-                            self.ema_gaps[name] if self.cfg.lambda_gap_ema_beta > 0 else gap_for_mode[name]
-                        )
+                        gap_ema_for_log[name] = float(gap_for_mode.get(name, 0.0))
                         gap_used_for_update[name] = 0.0
 
         # ========== 6. 构造返回的 metrics ==========
@@ -1268,12 +1220,30 @@ class MultiCriticPPO:
             "entropy": total_entropy / denom,
         }
 
+        metrics.update({
+            "use_lagrange_effective": bool(update_lambdas),  # 兼容旧字段
+            "update_lambdas_effective": bool(update_lambdas),
+            "use_penalty_terms_effective": bool(use_penalty_terms),
+            "use_cost_terms_effective": bool(use_cost_terms),
+            "has_cost_adv_effective": bool(has_cost_adv),
+        })
+
         if grad_decomp_metrics:
             metrics.update({k: float(v) for k, v in grad_decomp_metrics.items()})
 
+        pg_loss_r_like = total_pg_r_like / max(1, decomp_update_steps)
+        pg_loss_p_like = total_pg_p_like / max(1, decomp_update_steps)
+        pg_loss_c_e_like = total_pg_c_e_like / max(1, decomp_update_steps)
+        pg_loss_c_l_like = total_pg_c_l_like / max(1, decomp_update_steps)
+        metrics.update({
+            "pg_loss_total": metrics["policy_loss"],
+            "pg_loss_r_like": pg_loss_r_like,
+            "pg_loss_p_like": pg_loss_p_like,
+            "pg_loss_c_e_like": pg_loss_c_e_like,
+            "pg_loss_c_l_like": pg_loss_c_l_like,
+        })
+
         if actor_decomp_enabled:
-            pg_loss_r_like = total_pg_r_like / max(1, decomp_update_steps)
-            pg_loss_p_like = total_pg_p_like / max(1, decomp_update_steps)
             actor_decomp_stats.update({
                 "pg_loss_total": metrics["policy_loss"],
                 "pg_loss_r_like": pg_loss_r_like,
@@ -1315,17 +1285,30 @@ class MultiCriticPPO:
             if self.cfg.lambda_gap_ema_beta > 0:
                 metrics["ema_gap_total"] = gap_ema_for_log.get("total", 0.0)
 
-        # Dual 更新相关的诊断（统一记录 ratio gap 及实际使用的 gap）
+        # Dual 更新相关的诊断（改法3：gap 日志命名去歧义）
         if {"energy", "load"}.issubset(set(self.cost_names)) and not self.is_aggregated_mode:
-            metrics["gap_energy_raw"] = ratio_gaps.get("energy", 0.0)
-            metrics["gap_load_raw"] = ratio_gaps.get("load", 0.0)
-            metrics["gap_energy_ema"] = gap_ema_for_log.get("energy", ratio_gaps.get("energy", 0.0))
-            metrics["gap_load_ema"] = gap_ema_for_log.get("load", ratio_gaps.get("load", 0.0))
-            metrics["gap_energy_used"] = gap_used_for_update.get("energy", 0.0)
-            metrics["gap_load_used"] = gap_used_for_update.get("load", 0.0)
+            # 明确 absolute vs ratio
+            metrics["gap_abs_energy"] = gaps.get("energy", 0.0)
+            metrics["gap_abs_load"] = gaps.get("load", 0.0)
+            metrics["gap_ratio_energy"] = ratio_gaps.get("energy", 0.0)
+            metrics["gap_ratio_load"] = ratio_gaps.get("load", 0.0)
+            
+            # EMA（用于滞回或去相关）
+            metrics["gap_abs_energy_ema"] = gap_ema_for_log.get("energy", ratio_gaps.get("energy", 0.0))
+            metrics["gap_abs_load_ema"] = gap_ema_for_log.get("load", ratio_gaps.get("load", 0.0))
+            
+            # 实际用于更新 λ 的 gap
+            metrics["gap_abs_energy_used"] = gap_used_for_update.get("energy", 0.0)
+            metrics["gap_abs_load_used"] = gap_used_for_update.get("load", 0.0)
+            
+            # 相关性
             metrics["corr_gap_ema"] = corr_gap_for_log
-            metrics["risk_gap_energy_raw"] = risk_ratio_gaps.get("energy", 0.0)
-            metrics["risk_gap_load_raw"] = risk_ratio_gaps.get("load", 0.0)
+            
+            # 风险敏感（ratio）
+            metrics["risk_gap_ratio_energy"] = risk_ratio_gaps.get("energy", 0.0)
+            metrics["risk_gap_ratio_load"] = risk_ratio_gaps.get("load", 0.0)
+            
+            # 预条件化诊断
             if precond_diag:
                 metrics.update(precond_diag)
 

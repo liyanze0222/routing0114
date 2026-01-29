@@ -89,16 +89,14 @@ def make_env_from_config(cfg: dict, seed: int):
     # Cost 配置
     congestion_pattern = cfg.get("congestion_pattern", "block")
     congestion_density = cfg.get("congestion_density", 0.40)
-    energy_high_cost = cfg.get("energy_high_cost", 3.0)
     energy_high_density = cfg.get("energy_high_density", 0.20)
-    load_cost_scale = cfg.get("load_cost_scale", 1.0)
+    load_threshold = cfg.get("load_threshold", 0.6)
     
     # 观测配置
     include_congestion_obs = cfg.get("include_congestion_obs", True)
     congestion_patch_radius = cfg.get("congestion_patch_radius", 2)
     include_energy_obs = cfg.get("include_energy_obs", True)
     energy_patch_radius = cfg.get("energy_patch_radius", 2)
-    energy_obs_normalize = cfg.get("energy_obs_normalize", True)
     obs_rms = cfg.get("obs_rms", False)
     
     # 构建环境
@@ -127,9 +125,8 @@ def make_env_from_config(cfg: dict, seed: int):
         env,
         congestion_pattern=congestion_pattern,
         congestion_density=congestion_density,
-        energy_high_cost=energy_high_cost,
         energy_high_density=energy_high_density,
-        load_cost_scale=load_cost_scale,
+        load_threshold=load_threshold,
     )
     
     # Hard wrapper 在 obs wrapper 之前
@@ -139,7 +136,7 @@ def make_env_from_config(cfg: dict, seed: int):
         env = GridCongestionObsWrapper(env, patch_radius=congestion_patch_radius)
     
     if include_energy_obs:
-        env = GridEnergyObsWrapper(env, patch_radius=energy_patch_radius, normalize=energy_obs_normalize)
+        env = GridEnergyObsWrapper(env, patch_radius=energy_patch_radius)
     
     if obs_rms:
         env = GridObsNormWrapper(env)

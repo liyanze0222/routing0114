@@ -1,8 +1,0 @@
-{
-  "best_feasible_iter": 703,
-  "best_feasible_return": 8.36,
-  "energy_budget": 1.35,
-  "load_budget": 0.5,
-  "gap_energy": -0.009179687500000089,
-  "gap_load": -0.0343438982963562
-}

@@ -119,9 +119,9 @@ class GridCongestionObsWrapper(gym.ObservationWrapper):
         original_low = env.observation_space.low
         original_high = env.observation_space.high
 
-        # patch 部分的 low/high（congestion 值通常在 [0, 1] 或类似范围）
+        # patch 部分的 low/high（congestion 值在 [0, 1]）
         patch_low = np.zeros(self.patch_size, dtype=np.float32)
-        patch_high = np.ones(self.patch_size, dtype=np.float32) * 10.0  # 留余量
+        patch_high = np.ones(self.patch_size, dtype=np.float32)  # congestion_map 永远在 [0,1]
 
         self.observation_space = gym.spaces.Box(
             low=np.concatenate([original_low, patch_low]),

@@ -108,16 +108,12 @@ def parse_args():
         help="到达终点时的奖励（默认 10.0）"
     )
     parser.add_argument(
-        "--energy_high_cost", type=float, default=3.0,
-        help="高功率干扰区的能耗（默认 3.0）"
-    )
-    parser.add_argument(
         "--energy_high_density", type=float, default=0.2,
         help="高能耗区域在地图中的比例（0~1）"
     )
     parser.add_argument(
         "--congestion_density", type=float, default=0.3,
-        help="拥塞图平均拥堵程度（0~1）"
+        help="拥塞区域的面积比例（0~1），控制拥塞块/点的覆盖面积，强度固定为 Uniform(0,1)"
     )
     parser.add_argument(
         "--congestion_pattern", type=str, default="random",
@@ -129,8 +125,12 @@ def parse_args():
         )
     )
     parser.add_argument(
-        "--load_cost_scale", type=float, default=1.0,
-        help="load cost 的缩放系数（默认 1.0，用于匹配 energy 尺度）"
+        "--randomize_maps_each_reset", type=lambda x: x.lower() == "true", default=True,
+        help="是否在每次 reset 时重采样能耗/拥塞地图（训练默认 True，固定地图可设为 False）"
+    )
+    parser.add_argument(
+        "--load_threshold", type=float, default=0.6,
+        help="load cost 的软阈值 τ（默认 0.6）; load = max(0, (raw - τ) / (1 - τ))"
     )
     parser.add_argument(
         "--start_goal_mode", type=str, default="random",
@@ -162,10 +162,6 @@ def parse_args():
     parser.add_argument(
         "--energy_patch_radius", type=int, default=1,
         help="energy patch 半径"
-    )
-    parser.add_argument(
-        "--energy_obs_normalize", type=lambda x: x.lower() == "true", default=True,
-        help="energy patch 是否归一化到 [0,1]"
     )
     parser.add_argument(
         "--obs_rms", type=lambda x: x.lower() == "true", default=False,
@@ -240,8 +236,8 @@ def parse_args():
 
     # ========== 约束预算 ==========
     parser.add_argument(
-        "--energy_budget", type=float, default=1.5,
-        help="energy 成本预算（每步平均能耗上限）"
+        "--energy_budget", type=float, default=0.10,
+        help="energy 成本预算（每步平均能耗上限，energy ∈ [0,1]）"
     )
     parser.add_argument(
         "--load_budget", type=float, default=0.08,
@@ -469,18 +465,17 @@ def _build_env(args):
     )
     env = GridCostWrapper(
         base_env,
-        energy_base=1.0,
-        energy_high_cost=args.energy_high_cost,
         energy_high_density=args.energy_high_density,
         congestion_density=args.congestion_density,
         congestion_pattern=args.congestion_pattern,
-        load_cost_scale=args.load_cost_scale,
+        load_threshold=args.load_threshold,
+        randomize_maps_each_reset=args.randomize_maps_each_reset,
     )
     env = GridHardWrapper(env)
     if args.include_congestion_obs:
         env = GridCongestionObsWrapper(env, patch_radius=args.congestion_patch_radius)
     if args.include_energy_obs:
-        env = GridEnergyObsWrapper(env, patch_radius=args.energy_patch_radius, normalize=args.energy_obs_normalize)
+        env = GridEnergyObsWrapper(env, patch_radius=args.energy_patch_radius)
     if args.obs_rms:
         env = GridObsNormWrapper(env)
         print("✅ GridObsNormWrapper (Dynamic RunningMeanStd) Attached!")
@@ -713,12 +708,12 @@ def main():
         f"max_steps={max_steps_log}"
     )
     print(
-        f"Energy map: base=1.0, high_cost={args.energy_high_cost}, "
+        f"Energy map: binary 0/1, "
         f"density={args.energy_high_density}"
     )
     print(
         f"Load map: pattern={args.congestion_pattern}, "
-        f"density={args.congestion_density}, value_range=[0, 1]"
+        f"density={args.congestion_density}, threshold={args.load_threshold}"
     )
     print(f"Start/goal mode: {args.start_goal_mode}")
     if args.start_goal_mode == "rect":
@@ -732,7 +727,7 @@ def main():
     )
     print(
         f"  Energy obs: {args.include_energy_obs} "
-        f"(radius={args.energy_patch_radius}, normalize={args.energy_obs_normalize}, "
+        f"(radius={args.energy_patch_radius}, "
         f"dim={energy_dim})"
     )
     print(f"Observation dim: {obs_dim}")
@@ -911,6 +906,7 @@ def main():
     else:
         obs, info = env.reset(seed=args.seed)
     action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+    current_map_fingerprint = info.get("map_fingerprint")
 
     # ========== 记录环境统计信息 ==========
     env_stats = {}
@@ -970,6 +966,9 @@ def main():
 
     # ========== 训练循环 ==========
     for iteration in range(1, args.total_iters + 1):
+        map_fingerprints_iter: List[str] = []
+        if current_map_fingerprint is not None:
+            map_fingerprints_iter.append(current_map_fingerprint)
         # ========== 课程学习：动态更新 load_budget ==========
         if curriculum_scheduler is not None:
             current_load_budget = curriculum_scheduler.get_budget(iteration)
@@ -1042,9 +1041,15 @@ def main():
                 else:
                     obs, info = env.reset()
                 action_mask = info.get("action_mask", np.ones(act_dim, dtype=bool))
+                current_map_fingerprint = info.get("map_fingerprint", current_map_fingerprint)
+                if current_map_fingerprint is not None:
+                    map_fingerprints_iter.append(current_map_fingerprint)
 
         # PPO 更新
         metrics = agent.update()
+
+        env_map_changes = len(set(map_fingerprints_iter)) if map_fingerprints_iter else 0
+        last_map_fingerprint = map_fingerprints_iter[-1] if map_fingerprints_iter else None
 
         # 计算统计量
         recent_n = min(50, len(episode_returns))
@@ -1070,12 +1075,16 @@ def main():
             "lambda_load": metrics["lambda_load"],
             "budget_energy": args.energy_budget,
             "budget_load": args.load_budget,
+            "env_map_changes": env_map_changes,
             # 新增：gap 和 KKT 残差
             "gap_energy": metrics.get("gap_energy", metrics["avg_cost_energy"] - args.energy_budget),
             "gap_load": metrics.get("gap_load", metrics["avg_cost_load"] - args.load_budget),
             "kkt_energy": metrics.get("kkt_energy", metrics["lambda_energy"] * (metrics["avg_cost_energy"] - args.energy_budget)),
             "kkt_load": metrics.get("kkt_load", metrics["lambda_load"] * (metrics["avg_cost_load"] - args.load_budget)),
         }
+
+        if last_map_fingerprint is not None:
+            log_entry["env_map_fingerprint"] = last_map_fingerprint
 
         if args.log_actor_decomp:
             actor_keys = [
