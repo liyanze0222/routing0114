@@ -185,16 +185,41 @@ def load_traj_json(path: Path) -> Dict[int, List[Tuple[int, int]]]:
 
 def pick_representative_seeds(joined: pd.DataFrame, k: int = 8) -> List[int]:
     chosen: List[int] = []
+
     def add_from_series(series):
         for s in series:
             if s not in chosen:
                 chosen.append(int(s))
                 if len(chosen) >= k:
                     break
-    mask = (~joined["success_a"]) & (joined["success_b"])
-    add_from_series(joined.loc[mask, "seed"].head(k))
+
+    # 1) 高优先级候选：成功且 A 不可行、B 可行；若无 feasible 列则用 success flip
+    has_feasible = "feasible_a" in joined.columns and "feasible_b" in joined.columns
+    if has_feasible:
+        feasible_mask = (~joined["feasible_a"]) & (joined["feasible_b"]) & joined["success_a"] & joined["success_b"]
+    else:
+        feasible_mask = (~joined["success_a"]) & (joined["success_b"])
+
+    # detour 为 0 的附加约束（若存在）
+    if "detour_a" in joined.columns and "detour_b" in joined.columns:
+        feasible_mask = feasible_mask & (joined["detour_a"] == 0) & (joined["detour_b"] == 0)
+
+    candidates = joined.loc[feasible_mask].copy()
+    if not candidates.empty:
+        # 默认按 d_load 降序，可选更稳的 rank_key（d_load + d_energy）
+        rank_key = candidates["d_load"]
+        if "d_energy" in candidates.columns:
+            alt_rank = candidates["d_load"] + candidates["d_energy"]
+            # 若 alt_rank 的排序与 d_load 差异较大可切换；这里采用更稳的组合
+            rank_key = alt_rank
+        candidates = candidates.assign(_rank=rank_key)
+        add_from_series(candidates.sort_values("_rank", ascending=False)["seed"])
+
+    # 2) 其余名额：按 |d_load|、|d_energy| 补齐，保证多样性
     add_from_series(joined.reindex(joined["d_load"].abs().sort_values(ascending=False).index)["seed"])
-    add_from_series(joined.reindex(joined["d_energy"].abs().sort_values(ascending=False).index)["seed"])
+    if "d_energy" in joined.columns:
+        add_from_series(joined.reindex(joined["d_energy"].abs().sort_values(ascending=False).index)["seed"])
+
     return chosen[:k]
 
 
@@ -340,31 +365,67 @@ def run(args):
     visit_prob_b = npz_b["visit_prob"]
     occ_l1, occ_js = occupancy_distance(visit_prob_a, visit_prob_b)
 
+    # 轨迹一致性：计算同 seed 轨迹完全一致的比例
+    traj_a = load_traj_json(eval_a_traj)
+    traj_b = load_traj_json(eval_b_traj)
+    shared_seeds = set(traj_a.keys()) & set(traj_b.keys())
+    same_traj_count = sum(1 for s in shared_seeds if traj_a.get(s) == traj_b.get(s))
+    num_traj = len(shared_seeds)
+    same_traj_ratio = float(same_traj_count / num_traj) if num_traj > 0 else 0.0
+
     summary = summarize(joined, df_a, df_b, occ_l1, occ_js)
+    summary.update({
+        "same_traj_count": int(same_traj_count),
+        "same_traj_ratio": same_traj_ratio,
+        "num_seeds_traj": int(num_traj),
+    })
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print("[INFO] summary.json written")
-    print(f"occupancy L1={occ_l1:.6f}, JS={occ_js:.6f}")
+    print(f"occupancy L1={occ_l1:.6f}, JS={occ_js:.6f}, same_traj_ratio={same_traj_ratio:.4f} ({same_traj_count}/{num_traj})")
 
-    plot_hist(df_a, df_b, "agent_energy_mean", (label_a, label_b), out_dir / "hist_energy_mean.png")
-    plot_hist(df_a, df_b, "agent_load_mean", (label_a, label_b), out_dir / "hist_load_mean.png")
-    plot_scatter(joined, (label_a, label_b), out_dir / "scatter_energy_vs_load.png")
+    if args.plots_mode == "all":
+        plot_hist(df_a, df_b, "agent_energy_mean", (label_a, label_b), out_dir / "hist_energy_mean.png")
+        plot_hist(df_a, df_b, "agent_load_mean", (label_a, label_b), out_dir / "hist_load_mean.png")
+        plot_scatter(joined, (label_a, label_b), out_dir / "scatter_energy_vs_load.png")
 
-    plot_heatmap(visit_prob_a, out_dir / "heatmap_visit_A.png", f"Visit prob {label_a}")
-    plot_heatmap(visit_prob_b, out_dir / "heatmap_visit_B.png", f"Visit prob {label_b}")
-    plot_heatmap(visit_prob_b - visit_prob_a, out_dir / "heatmap_visit_diff.png", f"Visit diff {label_b}-{label_a}", cmap="coolwarm", symmetric=True)
+        plot_heatmap(visit_prob_a, out_dir / "heatmap_visit_A.png", f"Visit prob {label_a}")
+        plot_heatmap(visit_prob_b, out_dir / "heatmap_visit_B.png", f"Visit prob {label_b}")
+        plot_heatmap(visit_prob_b - visit_prob_a, out_dir / "heatmap_visit_diff.png", f"Visit diff {label_b}-{label_a}", cmap="coolwarm", symmetric=True)
 
-    traj_a = load_traj_json(eval_a_traj)
-    traj_b = load_traj_json(eval_b_traj)
-    seeds = pick_representative_seeds(joined, k=8)
-    cfg_a = load_config_from_dir(args.ckpt_a)
-    cfg_b = load_config_from_dir(args.ckpt_b)
-    roll_dir = ensure_dir(out_dir / "rollouts")
-    for seed in seeds:
-        if seed not in traj_a or seed not in traj_b:
-            continue
-        render_rollout(traj_a[seed], cfg_a, seed, label_a, roll_dir / f"seed{seed}_{label_a}.png")
-        render_rollout(traj_b[seed], cfg_b, seed, label_b, roll_dir / f"seed{seed}_{label_b}.png")
+    seeds: List[int] = []
+    if args.rollout_mode == "picked":
+        seeds = pick_representative_seeds(joined, k=args.rollout_k)
+    elif args.rollout_mode == "all":
+        max_seed = args.seed_start + args.num_seeds
+        seeds = [s for s in range(args.seed_start, max_seed) if s in traj_a and s in traj_b]
+
+    if args.rollout_mode != "none" and seeds:
+        cfg_a = load_config_from_dir(args.ckpt_a)
+        cfg_b = load_config_from_dir(args.ckpt_b)
+        roll_dir = ensure_dir(out_dir / "rollouts")
+        for seed in seeds:
+            if seed not in traj_a or seed not in traj_b:
+                continue
+            render_rollout(traj_a[seed], cfg_a, seed, label_a, roll_dir / f"seed{seed}_{label_a}.png")
+            render_rollout(traj_b[seed], cfg_b, seed, label_b, roll_dir / f"seed{seed}_{label_b}.png")
+
+    if args.rollout_mode == "picked":
+        picked_rows = joined[joined["seed"].isin(seeds)].copy()
+        cols_keep = [c for c in [
+            "seed",
+            "success_a", "success_b",
+            "feasible_a" if "feasible_a" in joined.columns else None,
+            "feasible_b" if "feasible_b" in joined.columns else None,
+            "agent_energy_mean_a", "agent_energy_mean_b",
+            "agent_load_mean_a", "agent_load_mean_b",
+            "d_energy", "d_load",
+            "detour_a" if "detour_a" in joined.columns else None,
+            "detour_b" if "detour_b" in joined.columns else None,
+        ] if c is not None and c in picked_rows.columns]
+        picked_rows = picked_rows[cols_keep]
+        picked_rows.to_csv(out_dir / "picked_seeds.csv", index=False)
+        print(f"[INFO] picked_seeds.csv written with {len(picked_rows)} rows")
 
 
 def parse_args():
@@ -378,6 +439,9 @@ def parse_args():
     parser.add_argument("--deterministic", type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--out_dir", type=str, default="outputs/evidence_chain/default")
+    parser.add_argument("--rollout_mode", type=str, choices=["none", "picked", "all"], default="picked")
+    parser.add_argument("--rollout_k", type=int, default=8, help="Only used when rollout_mode=picked")
+    parser.add_argument("--plots_mode", type=str, choices=["all", "none"], default="all")
     return parser.parse_args()
 
 

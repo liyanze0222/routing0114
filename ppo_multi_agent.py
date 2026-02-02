@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import os
 
 import numpy as np
 import torch
@@ -269,6 +270,8 @@ class MultiCriticPPO:
             "load": [],
         }
         self.precond_clip_window = 200  # 统计窗口大小
+        # dual 预条件化 clip 统计（energy, load 命中标记的元组）
+        self.dual_clip_hist: List[Tuple[float, float]] = []
 
     def _policy_parameters(self) -> List[torch.nn.Parameter]:
         """返回影响 policy logits 的参数集合（actor backbone + policy head）。
@@ -863,9 +866,10 @@ class MultiCriticPPO:
             avg_cost_total = float(total_cost_values.mean()) if len(total_cost_values) > 0 else 0.0
             std_cost_total = float(total_cost_values.std()) if len(total_cost_values) > 0 else 0.0
             
-            # 预算归一化后的目标是 1.0（或者是加权和的 budget）
+            # 预算归一化后的目标（加权 sum of normalized costs，权重和可不为 1）
             if self.cfg.agg_cost_normalize_by_budget:
-                total_budget = 1.0  # 归一化后的目标
+                wsum = self.cfg.agg_cost_w_energy + self.cfg.agg_cost_w_load
+                total_budget = wsum if wsum > 1e-8 else 1.0
             else:
                 energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
                 load_budget = self.cfg.cost_budgets.get("load", 1.0)
@@ -924,293 +928,377 @@ class MultiCriticPPO:
         
         corr_gap_for_log = 0.0
         precond_diag: Dict[str, float] = {}
+        decor_diag: Dict[str, float] = {}
 
         if update_lambdas:
             # D2: 检查是否到达更新频率
             should_update_lambda = (self._iter_count % self.cfg.lambda_update_freq == 0)
-
             if self.is_aggregated_mode:
-                # ========== aggregated 模式的 dual update ==========
-                # 仅更新 lambda_total（存储在 lambda["energy"]）
-                gap_for_update = risk_ratio_gap_total if self.cfg.lambda_gap_mode == "ratio" else risk_gap_total
-                
-                if should_update_lambda:
-                    # 使用 standard 模式（简化版，不使用 decorrelated/precond）
-                    # 获取 lambda_lr（优先使用 lambda_lr_energy，否则使用 lambda_lr）
-                    if self.cfg.lambda_lrs is not None:
-                        base_lr = self.cfg.lambda_lrs.get("energy", self.cfg.lambda_lr)
+                # ========== aggregated 模式的 dual update（单标量 gap_total） ==========
+                gap_total_used = risk_ratio_gap_total if self.cfg.lambda_gap_mode == "ratio" else risk_gap_total
+
+                # base lr（复用 energy 通道）
+                if self.cfg.lambda_lrs is not None:
+                    base_lr = self.cfg.lambda_lrs.get("energy", self.cfg.lambda_lr)
+                else:
+                    base_lr = self.cfg.lambda_lr
+
+                dual_mode = self.cfg.dual_update_mode
+                # 聚合模式下 decorrelated/precond 无法区分维度，退化到 hysteresis（或 standard）
+                if dual_mode in ("decorrelated", "precond", "preconditioned"):
+                    dual_mode = "hysteresis"
+
+                # hysteresis / both（单变量）
+                if dual_mode in ("hysteresis", "both"):
+                    g_raw = float(gap_total_used)
+                    beta_gap = self.cfg.dual_gap_ema_beta
+                    if beta_gap > 0:
+                        self.dual_gap_ema["energy"] = (1 - beta_gap) * self.dual_gap_ema["energy"] + beta_gap * g_raw
+                        g_ema = self.dual_gap_ema["energy"]
                     else:
-                        base_lr = self.cfg.lambda_lr
-                    
-                    # EMA 平滑（若启用）
+                        g_ema = g_raw
+                    gap_ema_for_log["total"] = g_ema
+
+                    g_used = g_raw if g_raw > 0 else g_ema
+                    if abs(g_used) <= self.cfg.dual_deadband:
+                        g_used = 0.0
+
+                    if should_update_lambda and g_used != 0.0:
+                        lr_up = self.cfg.lambda_lr_up if self.cfg.lambda_lr_up is not None else base_lr
+                        step_lr = lr_up if g_used > 0 else lr_up * self.cfg.dual_lr_down_scale
+                        new_lambda = self.lambdas["energy"] + step_lr * g_used
+                        new_lambda = max(0.0, new_lambda)
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+                        self.lambdas["energy"] = new_lambda
+                        gap_used_for_update["energy"] = g_used
+                    else:
+                        gap_used_for_update["energy"] = 0.0
+
+                    gap_used_for_update["load"] = 0.0
+                    self.lambdas["load"] = 0.0
+
+                else:
+                    # standard 聚合：保持原行为（projected ascent，可选 EMA + deadzone）
+                    effective_gap = gap_total_used
                     if self.cfg.lambda_gap_ema_beta > 0:
                         beta = self.cfg.lambda_gap_ema_beta
-                        # 复用 ema_gaps["energy"] 存储 total gap 的 EMA
-                        self.ema_gaps["energy"] = (1 - beta) * self.ema_gaps.get("energy", 0.0) + beta * gap_for_update
+                        self.ema_gaps["energy"] = (1 - beta) * self.ema_gaps.get("energy", 0.0) + beta * effective_gap
                         effective_gap = self.ema_gaps["energy"]
-                    else:
-                        effective_gap = gap_for_update
-                    
                     gap_ema_for_log["total"] = effective_gap
-                    
-                    # deadzone（若启用）
+
                     deadzone = self.cfg.lambda_deadzone
                     if deadzone > 0 and abs(effective_gap) < deadzone:
                         effective_gap = 0.0
-                    
-                    # 更新 lambda_total
-                    new_lambda = max(0.0, self.lambdas["energy"] + base_lr * effective_gap)
-                    
-                    # lambda_max clamp
-                    if self.cfg.lambda_max is not None:
-                        new_lambda = min(new_lambda, self.cfg.lambda_max)
-                    
-                    self.lambdas["energy"] = new_lambda
-                    gap_used_for_update["energy"] = effective_gap
-                    # load lambda 保持为 0
+
+                    if should_update_lambda:
+                        new_lambda = max(0.0, self.lambdas["energy"] + base_lr * effective_gap)
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+                        self.lambdas["energy"] = new_lambda
+                        gap_used_for_update["energy"] = effective_gap
+                    else:
+                        gap_used_for_update["energy"] = 0.0
+
                     gap_used_for_update["load"] = 0.0
-                else:
-                    # 未到更新频率
-                    gap_used_for_update["energy"] = 0.0
-                    gap_used_for_update["load"] = 0.0
-                    
+                    self.lambdas["load"] = 0.0
+
             else:
                 # ========== separate 模式的 dual update（保持原逻辑） ==========
                 # 预备：选择用于 dual 更新的原始 gap（ratio 或 absolute）
                 gap_for_mode = risk_ratio_gaps if self.cfg.lambda_gap_mode == "ratio" else risk_gaps
 
-            # ====== dual 模式：hysteresis / decorrelated / both ======
-            if self.cfg.dual_update_mode != "standard":
-                # 1) gap EMA（若 beta<=0 则退化为原 gap）
-                beta_gap = self.cfg.dual_gap_ema_beta
-                dual_gbar: Dict[str, float] = {}
-                for name in self.cost_names:
-                    if beta_gap > 0:
-                        self.dual_gap_ema[name] = (1 - beta_gap) * self.dual_gap_ema[name] + beta_gap * gap_for_mode[name]
-                        dual_gbar[name] = self.dual_gap_ema[name]
-                    else:
-                        dual_gbar[name] = gap_for_mode[name]
-                    gap_ema_for_log[name] = dual_gbar[name]
-
-                # 2) 相关性消耦（仅 energy-load 对）
-                corr_val = 0.0
-                varE = varL = covEL = 0.0
-                precond_diag: Dict[str, float] = {}
-                has_e_l = {"energy", "load"}.issubset(set(self.cost_names))
-                gE = dual_gbar.get("energy", 0.0)
-                gL = dual_gbar.get("load", 0.0)
-
-                if has_e_l and self.cfg.dual_update_mode in ("decorrelated", "both", "precond", "preconditioned"):
-                    b = self.cfg.dual_corr_ema_beta
-                    use_ema_stats = self.cfg.dual_precond_use_ema_stats or self.cfg.dual_update_mode in ("decorrelated", "both")
-
-                    meanE = self.dual_corr_state["mean"]["energy"]
-                    meanL = self.dual_corr_state["mean"]["load"]
-                    if use_ema_stats:
-                        meanE = (1 - b) * meanE + b * gE
-                        meanL = (1 - b) * meanL + b * gL
-                        varE = (1 - b) * self.dual_corr_state["var"]["energy"] + b * (gE - meanE) ** 2
-                        varL = (1 - b) * self.dual_corr_state["var"]["load"] + b * (gL - meanL) ** 2
-                        covEL = (1 - b) * self.dual_corr_state["cov"] + b * (gE - meanE) * (gL - meanL)
-
-                        self.dual_corr_state["mean"]["energy"] = meanE
-                        self.dual_corr_state["mean"]["load"] = meanL
-                        self.dual_corr_state["var"]["energy"] = varE
-                        self.dual_corr_state["var"]["load"] = varL
-                        self.dual_corr_state["cov"] = covEL
-                    else:
-                        varE = gE * gE
-                        varL = gL * gL
-                        covEL = gE * gL
-
-                    denom = varE * varL
-                    if self.cfg.dual_update_mode in ("decorrelated", "both"):
-                        if denom < 1e-8:
-                            corr_val = 0.0
-                        else:
-                            corr_val = float(np.clip(covEL / np.sqrt(denom + 1e-8), -0.95, 0.95))
-                corr_gap_for_log = corr_val
-
-                dual_source = dual_gbar
-
-                # 预条件化（仅 energy-load 对）- Diag-Only 版本
-                if has_e_l and self.cfg.dual_update_mode in ("precond", "preconditioned"):
-                    eps = self.cfg.dual_precond_eps
-                    clip_val = self.cfg.dual_precond_clip
-                    strength = self.cfg.dual_precond_strength
-
-                    # Fallback 检测：varE 或 varL 非有限时触发
-                    fallback = 0
-                    if not np.isfinite(varE) or not np.isfinite(varL):
-                        fallback = 1
-                        scale_E = 1.0
-                        scale_L = 1.0
-                    else:
-                        scale_E = 1.0 / (varE + eps)
-                        scale_L = 1.0 / (varL + eps)
-
-                    # 构造 g_pre = [gE * scale_E, gL * scale_L]
-                    g_pre_energy = gE * scale_E
-                    g_pre_load = gL * scale_L
-
-                    # Strength 混合：g_used_raw = (1-strength)*g + strength*g_pre
-                    g_used_energy_raw = (1 - strength) * gE + strength * g_pre_energy
-                    g_used_load_raw = (1 - strength) * gL + strength * g_pre_load
-
-                    # Clip g_used 的每个分量
-                    g_used_energy_clipped = float(np.clip(g_used_energy_raw, -clip_val, clip_val))
-                    g_used_load_clipped = float(np.clip(g_used_load_raw, -clip_val, clip_val))
-
-                    # 统计 clip_hit：基于 raw 值判断
-                    clip_hit_e = 1.0 if abs(g_used_energy_raw) >= clip_val - 1e-6 else 0.0
-                    clip_hit_l = 1.0 if abs(g_used_load_raw) >= clip_val - 1e-6 else 0.0
-                    self.precond_clip_history["energy"].append(clip_hit_e)
-                    self.precond_clip_history["load"].append(clip_hit_l)
-                    # 保持窗口大小
-                    if len(self.precond_clip_history["energy"]) > self.precond_clip_window:
-                        self.precond_clip_history["energy"].pop(0)
-                    if len(self.precond_clip_history["load"]) > self.precond_clip_window:
-                        self.precond_clip_history["load"].pop(0)
-
-                    # 计算 clip_hit_rate
-                    clip_hit_rate_e = np.mean(self.precond_clip_history["energy"]) if self.precond_clip_history["energy"] else 0.0
-                    clip_hit_rate_l = np.mean(self.precond_clip_history["load"]) if self.precond_clip_history["load"] else 0.0
-
-                    dual_source = dual_gbar.copy()
-                    dual_source["energy"] = g_used_energy_clipped
-                    dual_source["load"] = g_used_load_clipped
-
-                    shrink_E = g_used_energy_clipped / (gE + 1e-8)
-                    shrink_L = g_used_load_clipped / (gL + 1e-8)
-
-                    # 条件数近似：用 scale 的比值定义
-                    if fallback == 1:
-                        cond_approx = 1.0
-                    else:
-                        max_scale = max(scale_E, scale_L)
-                        min_scale = min(scale_E, scale_L)
-                        cond_approx = max_scale / max(min_scale, 1e-12)
-
-                    precond_diag = {
-                        "dual_precond_var_energy": float(varE),
-                        "dual_precond_var_load": float(varL),
-                        "dual_precond_scale_energy": float(scale_E),
-                        "dual_precond_scale_load": float(scale_L),
-                        "dual_precond_gtilde_energy_raw": float(g_used_energy_raw),
-                        "dual_precond_gtilde_load_raw": float(g_used_load_raw),
-                        "dual_precond_gtilde_energy": float(g_used_energy_clipped),
-                        "dual_precond_gtilde_load": float(g_used_load_clipped),
-                        "dual_precond_g_energy": float(gE),
-                        "dual_precond_g_load": float(gL),
-                        "dual_precond_shrink_energy": float(shrink_E),
-                        "dual_precond_shrink_load": float(shrink_L),
-                        "dual_precond_clip_hit_rate_energy": float(clip_hit_rate_e),
-                        "dual_precond_clip_hit_rate_load": float(clip_hit_rate_l),
-                        "dual_precond_fallback": fallback,
-                        "dual_precond_cond_approx": float(cond_approx),
-                    }
-
-                    if should_update_lambda:
-                        print(
-                            f"[DUAL-PRECOND] g=({gE:.4f},{gL:.4f}) scale=({scale_E:.4f},{scale_L:.4f}) "
-                            f"raw=({g_used_energy_raw:.4f},{g_used_load_raw:.4f}) used=({g_used_energy_clipped:.4f},{g_used_load_clipped:.4f}) "
-                            f"var=({varE:.4f},{varL:.4f}) cond~{cond_approx:.2f} "
-                            f"shrink=({shrink_E:.3f},{shrink_L:.3f}) clip_rate=({clip_hit_rate_e:.2%},{clip_hit_rate_l:.2%}) fallback={fallback}"
-                        )
-
-                # decorrelate（若需要）
-                if self.cfg.dual_update_mode in ("decorrelated", "both") and has_e_l:
-                    gtilde_energy = dual_gbar["energy"] - corr_val * dual_gbar["load"]
-                    gtilde_load = dual_gbar["load"] - corr_val * dual_gbar["energy"]
-                    dual_source = dual_gbar.copy()
-                    dual_source["energy"] = gtilde_energy
-                    dual_source["load"] = gtilde_load
-
-                # hysteresis 更新（hysteresis 或 both）
-                if should_update_lambda:
+                # ====== dual 模式：hysteresis / decorrelated / both ======
+                if self.cfg.dual_update_mode != "standard":
+                    # 1) gap EMA（若 beta<=0 则退化为原 gap）
+                    beta_gap = self.cfg.dual_gap_ema_beta
+                    dual_gbar: Dict[str, float] = {}
                     for name in self.cost_names:
-                        # 改法2：per-cost lr，优先 lambda_lr_energy/lambda_lr_load
-                        if name == "energy":
-                            base_lr = getattr(self.cfg, "lambda_lr_energy", None)
+                        if beta_gap > 0:
+                            self.dual_gap_ema[name] = (1 - beta_gap) * self.dual_gap_ema[name] + beta_gap * gap_for_mode[name]
+                            dual_gbar[name] = self.dual_gap_ema[name]
                         else:
-                            base_lr = getattr(self.cfg, "lambda_lr_load", None)
-                        
-                        if base_lr is None:
-                            if self.cfg.lambda_lrs is not None:
-                                base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
-                            else:
-                                base_lr = self.cfg.lambda_lr
+                            dual_gbar[name] = gap_for_mode[name]
+                        gap_ema_for_log[name] = dual_gbar[name]
 
-                        # hysteresis 分支
-                        if self.cfg.dual_update_mode in ("hysteresis", "both"):
-                            # 改法1：正向用 raw gap，负向用 EMA
-                            g_raw = float(gap_for_mode.get(name, 0.0))
-                            g_ema = dual_source.get(name, dual_gbar[name])
+                    # 2) 相关性消耦（仅 energy-load 对）
+                    corr_val = 0.0
+                    varE = varL = covEL = 0.0
+                    precond_diag: Dict[str, float] = {}
+                    has_e_l = {"energy", "load"}.issubset(set(self.cost_names))
+                    gE = dual_gbar.get("energy", 0.0)
+                    gL = dual_gbar.get("load", 0.0)
+
+                    if has_e_l and self.cfg.dual_update_mode in ("decorrelated", "both", "precond", "preconditioned"):
+                        b = self.cfg.dual_corr_ema_beta
+                        use_ema_stats = self.cfg.dual_precond_use_ema_stats or self.cfg.dual_update_mode in ("decorrelated", "both")
+
+                        meanE = self.dual_corr_state["mean"]["energy"]
+                        meanL = self.dual_corr_state["mean"]["load"]
+                        if use_ema_stats:
+                            meanE = (1 - b) * meanE + b * gE
+                            meanL = (1 - b) * meanL + b * gL
+                            varE = (1 - b) * self.dual_corr_state["var"]["energy"] + b * (gE - meanE) ** 2
+                            varL = (1 - b) * self.dual_corr_state["var"]["load"] + b * (gL - meanL) ** 2
+                            covEL = (1 - b) * self.dual_corr_state["cov"] + b * (gE - meanE) * (gL - meanL)
+
+                            self.dual_corr_state["mean"]["energy"] = meanE
+                            self.dual_corr_state["mean"]["load"] = meanL
+                            self.dual_corr_state["var"]["energy"] = varE
+                            self.dual_corr_state["var"]["load"] = varL
+                            self.dual_corr_state["cov"] = covEL
+                        else:
+                            varE = gE * gE
+                            varL = gL * gL
+                            covEL = gE * gL
+
+                        denom = varE * varL
+                        if self.cfg.dual_update_mode in ("decorrelated", "both"):
+                            if denom < 1e-8:
+                                corr_val = 0.0
+                            else:
+                                corr_val = float(np.clip(covEL / np.sqrt(denom + 1e-8), -0.95, 0.95))
+                    corr_gap_for_log = corr_val
+
+                    dual_source = dual_gbar
+
+                    # 预条件化（仅 energy-load 对）- 2x2 协方差预条件化（C^{-1} g），带稳健 fallback
+                    if has_e_l and self.cfg.dual_update_mode in ("precond", "preconditioned"):
+                        eps = float(self.cfg.dual_precond_eps)
+                        clip_val = float(self.cfg.dual_precond_clip)
+                        strength = float(self.cfg.dual_precond_strength)
+
+                        gE = float(dual_gbar["energy"])
+                        gL = float(dual_gbar["load"])
+                        a = float(varE)   # Var(E)
+                        b = float(varL)   # Var(L)
+                        c = float(covEL)  # Cov(E,L)
+
+                        fallback = 0
+                        det = float("nan")
+                        cond_approx = 1.0
+
+                        # 默认：不变
+                        g_pre_energy = gE
+                        g_pre_load = gL
+
+                        # 数值检查
+                        if not (np.isfinite(a) and np.isfinite(b) and np.isfinite(c)):
+                            fallback = 1
+                        else:
+                            a_eps = a + eps
+                            b_eps = b + eps
+                            det = a_eps * b_eps - c * c
+
+                            if (not np.isfinite(det)) or det <= 1e-12:
+                                # 退化：使用对角预条件化
+                                fallback = 1
+                                inv_a = 1.0 / max(a_eps, 1e-12)
+                                inv_b = 1.0 / max(b_eps, 1e-12)
+                                g_pre_energy = inv_a * gE
+                                g_pre_load = inv_b * gL
+                            else:
+                                # 2x2 逆： (1/det) * [[b, -c],[-c, a]]
+                                inv00 = b_eps / det
+                                inv01 = -c / det
+                                inv11 = a_eps / det
+
+                                g_pre_energy = inv00 * gE + inv01 * gL
+                                g_pre_load = inv01 * gE + inv11 * gL
+
+                                # condition number 近似（用于诊断）
+                                tr = a_eps + b_eps
+                                disc = (a_eps - b_eps) ** 2 + 4.0 * c * c
+                                sqrt_disc = float(np.sqrt(max(disc, 0.0)))
+                                eig_max = 0.5 * (tr + sqrt_disc)
+                                eig_min = max(0.5 * (tr - sqrt_disc), 1e-12)
+                                cond_approx = float(eig_max / eig_min)
+
+                        # strength 混合：g_used = (1-s)*g + s*g_pre
+                        g_used_energy_raw = (1.0 - strength) * gE + strength * g_pre_energy
+                        g_used_load_raw = (1.0 - strength) * gL + strength * g_pre_load
+
+                        # clip
+                        g_used_energy = float(np.clip(g_used_energy_raw, -clip_val, clip_val))
+                        g_used_load = float(np.clip(g_used_load_raw, -clip_val, clip_val))
+
+                        # 记录诊断指标
+                        clip_hit_energy = 1.0 if abs(g_used_energy) >= clip_val - 1e-12 else 0.0
+                        clip_hit_load = 1.0 if abs(g_used_load) >= clip_val - 1e-12 else 0.0
+                        self.dual_clip_hist.append((clip_hit_energy, clip_hit_load))
+                        if len(self.dual_clip_hist) > 200:
+                            self.dual_clip_hist.pop(0)
+                        clip_rate_energy = float(np.mean([x[0] for x in self.dual_clip_hist])) if self.dual_clip_hist else 0.0
+                        clip_rate_load = float(np.mean([x[1] for x in self.dual_clip_hist])) if self.dual_clip_hist else 0.0
+
+                        # 预条件化后的 g 用于 hysteresis / 更新
+                        dual_source = dual_gbar.copy()
+                        dual_source["energy"] = g_used_energy
+                        dual_source["load"] = g_used_load
+
+                        # 诊断：缩放比例（相对于原 gbar）
+                        shrink_E = (g_used_energy / (gE + 1e-8)) if abs(gE) > 1e-12 else 0.0
+                        shrink_L = (g_used_load / (gL + 1e-8)) if abs(gL) > 1e-12 else 0.0
+
+                        precond_diag = {
+                            "dual_precond_var_energy": float(a),
+                            "dual_precond_var_load": float(b),
+                            "dual_precond_cov_el": float(c),
+                            "dual_precond_det": float(det),
+                            "dual_precond_cond_approx": float(cond_approx),
+                            "dual_precond_gpre_energy": float(g_pre_energy),
+                            "dual_precond_gpre_load": float(g_pre_load),
+                            "dual_precond_clip_energy": float(clip_hit_energy),
+                            "dual_precond_clip_load": float(clip_hit_load),
+                            "dual_precond_clip_rate_energy": float(clip_rate_energy),
+                            "dual_precond_clip_rate_load": float(clip_rate_load),
+                            "dual_precond_shrink_energy": float(shrink_E),
+                            "dual_precond_shrink_load": float(shrink_L),
+                            "dual_precond_fallback": float(fallback),
+                        }
+
+                    # decorrelate（若需要）: 用回归系数 cov/var 做残差化（比 corr*gap 更稳健）
+                    if self.cfg.dual_update_mode in ("decorrelated", "both") and has_e_l:
+                        reg_eps = 1e-8
+                        beta_e_on_l = (covEL / (varL + reg_eps)) if varL > 1e-12 else 0.0
+                        beta_l_on_e = (covEL / (varE + reg_eps)) if varE > 1e-12 else 0.0
+                        beta_clip = 5.0
+                        beta_e_on_l = float(np.clip(beta_e_on_l, -beta_clip, beta_clip))
+                        beta_l_on_e = float(np.clip(beta_l_on_e, -beta_clip, beta_clip))
+
+                        gtilde_energy = dual_gbar["energy"] - beta_e_on_l * dual_gbar["load"]
+                        gtilde_load = dual_gbar["load"] - beta_l_on_e * dual_gbar["energy"]
+
+                        dual_source = dual_gbar.copy()
+                        dual_source["energy"] = gtilde_energy
+                        dual_source["load"] = gtilde_load
+
+                        decor_diag = {
+                            "dual_decor_beta_e_on_l": float(beta_e_on_l),
+                            "dual_decor_beta_l_on_e": float(beta_l_on_e),
+                        }
+
+                    # hysteresis 更新（hysteresis 或 both）
+                    if should_update_lambda:
+                        for name in self.cost_names:
+                            # 改法2：per-cost lr，优先 lambda_lr_energy/lambda_lr_load
+                            if name == "energy":
+                                base_lr = getattr(self.cfg, "lambda_lr_energy", None)
+                            else:
+                                base_lr = getattr(self.cfg, "lambda_lr_load", None)
                             
-                            if g_raw > 0:
-                                # 超预算时：直接用 raw gap，不经过 deadband
-                                g_val = g_raw
+                            if base_lr is None:
+                                if self.cfg.lambda_lrs is not None:
+                                    base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                                else:
+                                    base_lr = self.cfg.lambda_lr
+
+                            # hysteresis 分支
+                            if self.cfg.dual_update_mode in ("hysteresis", "both"):
+                                # 改法1：正向用 raw gap，负向用 EMA
+                                g_raw = float(gap_for_mode.get(name, 0.0))
+                                g_ema = dual_source.get(name, dual_gbar[name])
+                                
+                                if g_raw > 0:
+                                    # 超预算时：直接用 raw gap，不经过 deadband
+                                    g_val = g_raw
+                                else:
+                                    # 可行/富余时：用 EMA + deadband 慢下降
+                                    g_val = g_ema
+                                    if abs(g_val) <= self.cfg.dual_deadband:
+                                        gap_used_for_update[name] = 0.0
+                                        continue
+
+                                lr_up = self.cfg.lambda_lr_up if self.cfg.lambda_lr_up is not None else base_lr
+                                step_lr = lr_up if g_val > 0 else lr_up * self.cfg.dual_lr_down_scale
+                                new_lambda = max(0.0, self.lambdas[name] + step_lr * g_val)
+                                gap_used_for_update[name] = g_val
                             else:
-                                # 可行/富余时：用 EMA + deadband 慢下降
-                                g_val = g_ema
-                                if abs(g_val) <= self.cfg.dual_deadband:
-                                    gap_used_for_update[name] = 0.0
-                                    continue
+                                # decorrelated-only 分支
+                                g_val = dual_source.get(name, dual_gbar[name])
+                                lr = base_lr
+                                new_lambda = max(0.0, self.lambdas[name] + lr * g_val)
+                                gap_used_for_update[name] = g_val
 
-                            lr_up = self.cfg.lambda_lr_up if self.cfg.lambda_lr_up is not None else base_lr
-                            step_lr = lr_up if g_val > 0 else lr_up * self.cfg.dual_lr_down_scale
-                            new_lambda = max(0.0, self.lambdas[name] + step_lr * g_val)
-                            gap_used_for_update[name] = g_val
-                        else:
-                            # decorrelated-only 分支
-                            g_val = dual_source.get(name, dual_gbar[name])
-                            lr = base_lr
-                            new_lambda = max(0.0, self.lambdas[name] + lr * g_val)
-                            gap_used_for_update[name] = g_val
+                            if self.cfg.lambda_max is not None:
+                                new_lambda = min(new_lambda, self.cfg.lambda_max)
+                            self.lambdas[name] = new_lambda
+                    else:
+                        # 未到更新频率，日志仍保留 gbar 与 corr
+                        gap_used_for_update.update({name: 0.0 for name in self.cost_names})
 
-                        if self.cfg.lambda_max is not None:
-                            new_lambda = min(new_lambda, self.cfg.lambda_max)
-                        self.lambdas[name] = new_lambda
+                # ====== standard 模式：projected dual ascent（支持 D1-D8，对齐 args）======
                 else:
-                    # 未到更新频率，日志仍保留 gbar 与 corr
-                    gap_used_for_update.update({name: 0.0 for name in self.cost_names})
+                    # 1) 可选：gap EMA（D1）。注意：这里的 EMA 只用于对偶更新与日志，
+                    # 不改变 cost 的统计口径（avg_cost 仍是 batch 平均）。
+                    beta = float(getattr(self.cfg, "lambda_gap_ema_beta", 0.0) or 0.0)
+                    use_gap_ema = beta > 0.0
 
-            # ====== standard 模式：projected dual ascent（不使用 EMA，直接用 raw gap）======
-            else:
-                if should_update_lambda:
+                    # 先决定“用于更新/日志的 gap”（EMA 或 raw）
                     for name in self.cost_names:
                         g_raw = float(gap_for_mode.get(name, 0.0))
-                        
-                        # standard 模式不使用 EMA，直接用 raw gap 更新
-                        g_used = g_raw
-
-                        # per-cost lr：优先 lambda_lr_energy / lambda_lr_load，再回退到已有逻辑
-                        if name == "energy":
-                            lr = getattr(self.cfg, "lambda_lr_energy", None)
+                        if use_gap_ema:
+                            self.ema_gaps[name] = (1.0 - beta) * float(self.ema_gaps.get(name, 0.0)) + beta * g_raw
+                            g_for_update = float(self.ema_gaps[name])
                         else:
-                            lr = getattr(self.cfg, "lambda_lr_load", None)
+                            g_for_update = g_raw
+                        gap_ema_for_log[name] = float(g_for_update)
 
-                        if lr is None:
-                            if self.cfg.lambda_lrs is not None:
-                                lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                    # 2) D2：两时间尺度（lambda_update_freq）
+                    if not should_update_lambda:
+                        for name in self.cost_names:
+                            gap_used_for_update[name] = 0.0
+                    else:
+                        for name in self.cost_names:
+                            g_signed = float(gap_ema_for_log.get(name, 0.0))
+
+                            # D3 + D7 + D8：deadzone（支持 per-cost 与非对称 deadzone）
+                            dz = float(getattr(self.cfg, "lambda_deadzone", 0.0) or 0.0)
+                            dz_map = getattr(self.cfg, "lambda_deadzones", None)
+                            if isinstance(dz_map, dict):
+                                dz = float(dz_map.get(name, dz))
+
+                            dz_up = getattr(self.cfg, "lambda_deadzone_up", None)
+                            dz_down = getattr(self.cfg, "lambda_deadzone_down", None)
+                            if g_signed > 0.0 and dz_up is not None:
+                                dz = float(dz_up)
+                            elif g_signed < 0.0 and dz_down is not None:
+                                dz = float(dz_down)
+
+                            if dz > 0.0 and abs(g_signed) < dz:
+                                gap_used_for_update[name] = 0.0
+                                continue
+
+                            # per-cost base lr：优先 lambda_lr_energy / lambda_lr_load，再回退到 lambda_lrs / lambda_lr
+                            if name == "energy":
+                                base_lr = getattr(self.cfg, "lambda_lr_energy", None)
                             else:
-                                lr = self.cfg.lambda_lr
+                                base_lr = getattr(self.cfg, "lambda_lr_load", None)
 
-                        new_lambda = max(
-                            0.0,
-                            float(self.lambdas.get(name, 0.0)) + float(lr) * float(g_used),
-                        )
-                        if self.cfg.lambda_max is not None:
-                            new_lambda = min(new_lambda, float(self.cfg.lambda_max))
+                            if base_lr is None:
+                                if self.cfg.lambda_lrs is not None:
+                                    base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                                else:
+                                    base_lr = self.cfg.lambda_lr
+                            base_lr = float(base_lr)
 
-                        self.lambdas[name] = new_lambda
-                        gap_used_for_update[name] = float(g_used)
-                        gap_ema_for_log[name] = float(g_used)  # standard 模式下 EMA 等于 raw
-                else:
-                    # 未到更新频率
-                    for name in self.cost_names:
-                        gap_ema_for_log[name] = float(gap_for_mode.get(name, 0.0))
-                        gap_used_for_update[name] = 0.0
+                            # D5-D6：非对称学习率（up / down）
+                            lr_up = float(self.cfg.lambda_lr_up) if self.cfg.lambda_lr_up is not None else base_lr
+                            lr_down = float(self.cfg.lambda_lr_down) if self.cfg.lambda_lr_down is not None else base_lr
+                            if g_signed > 0.0:
+                                lr = lr_up
+                            elif g_signed < 0.0:
+                                lr = lr_down
+                            else:
+                                lr = base_lr
+
+                            # projected ascent + D4：lambda_max
+                            new_lambda = max(0.0, float(self.lambdas.get(name, 0.0)) + lr * g_signed)
+                            if self.cfg.lambda_max is not None:
+                                new_lambda = min(new_lambda, float(self.cfg.lambda_max))
+
+                            self.lambdas[name] = float(new_lambda)
+                            gap_used_for_update[name] = float(g_signed)
 
         # ========== 6. 构造返回的 metrics ==========
         denom = max(update_steps, 1)
@@ -1273,7 +1361,8 @@ class MultiCriticPPO:
             metrics["cost_total_mean"] = avg_cost_total
             metrics["cost_total_std"] = std_cost_total
             if self.cfg.agg_cost_normalize_by_budget:
-                metrics["cost_total_budget"] = 1.0
+                wsum = self.cfg.agg_cost_w_energy + self.cfg.agg_cost_w_load
+                metrics["cost_total_budget"] = wsum if wsum > 1e-8 else 1.0
             else:
                 energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
                 load_budget = self.cfg.cost_budgets.get("load", 1.0)
@@ -1311,6 +1400,10 @@ class MultiCriticPPO:
             # 预条件化诊断
             if precond_diag:
                 metrics.update(precond_diag)
+
+            # 去相关/消耦诊断
+            if decor_diag:
+                metrics.update(decor_diag)
 
         metrics["lambda_gap_mode"] = self.cfg.lambda_gap_mode
         
@@ -1390,6 +1483,59 @@ class MultiCriticPPO:
             self.ema_gaps = checkpoint["ema_gaps"]
         if "iter_count" in checkpoint:
             self._iter_count = checkpoint["iter_count"]
+
+
+# ========== Minimal smoke test for aggregated + hysteresis dual update ==========
+def _smoke_test_aggregated_hysteresis():
+    """Run a tiny update to ensure aggregated + hysteresis dual path does not crash."""
+    cfg = MultiCriticPPOConfig(
+        obs_dim=4,
+        act_dim=2,
+        hidden_dim=8,
+        batch_size=4,
+        minibatch_size=2,
+        update_epochs=1,
+        cost_critic_mode="aggregated",
+        agg_cost_w_energy=1.0,
+        agg_cost_w_load=1.0,
+        agg_cost_normalize_by_budget=True,
+        cost_budgets={"energy": 0.5, "load": 0.5},
+        dual_update_mode="hysteresis",
+        dual_gap_ema_beta=0.1,
+        dual_deadband=0.0,
+        lambda_gap_mode="absolute",
+        update_lambdas=True,
+    )
+    agent = MultiCriticPPO(cfg)
+    steps = cfg.batch_size
+    agent.rollout_buffer = {
+        "obs": [np.zeros(cfg.obs_dim, dtype=np.float32) for _ in range(steps)],
+        "actions": [0 for _ in range(steps)],
+        "log_probs": [0.0 for _ in range(steps)],
+        "action_masks": [np.ones(cfg.act_dim, dtype=np.float32) for _ in range(steps)],
+        "rewards": [1.0 for _ in range(steps)],
+        "v_rewards": [0.0 for _ in range(steps)],
+        "dones": [0.0 for _ in range(steps)],
+        "cost_total": [0.6 for _ in range(steps)],
+        "v_cost_total": [0.0 for _ in range(steps)],
+        "costs": {
+            "energy": [0.6 for _ in range(steps)],
+            "load": [0.6 for _ in range(steps)],
+        },
+        "v_costs": {
+            "energy": [0.0 for _ in range(steps)],
+            "load": [0.0 for _ in range(steps)],
+        },
+    }
+    agent.update()
+    print("[SMOKE] aggregated+hysteresis update completed without error")
+
+
+if __name__ == "__main__":
+    if os.environ.get("RUN_PPO_MULTI_AGENT_SMOKE", "0") == "1":
+        _smoke_test_aggregated_hysteresis()
+    # 兼容性：允许直接运行进行简单测试
+    print("This module is intended to be imported and used by training scripts.")
 
 
 # ==================== 兼容性别名 ====================

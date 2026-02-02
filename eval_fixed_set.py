@@ -200,6 +200,8 @@ def evaluate_fixed_set(
     device: str = "cpu",
     deterministic: bool = False,
     out_csv: str = None,
+    energy_budget_override: Optional[float] = None,
+    load_budget_override: Optional[float] = None,
     # 环境参数（可从 config 覆盖）
     grid_size: int = 8,
     step_penalty: float = -1.0,
@@ -231,10 +233,10 @@ def evaluate_fixed_set(
     start_goal_mode = config.get('start_goal_mode', start_goal_mode or "random")
     start_rect = _parse_rect(config.get('start_rect', start_rect))
     goal_rect = _parse_rect(config.get('goal_rect', goal_rect))
-    energy_budget = config.get('energy_budget')
-    load_budget = config.get('load_budget')
-    if energy_budget is None or load_budget is None:
-        print("[WARN] energy_budget/load_budget not found in config; feasible will fall back to success.")
+    energy_budget = energy_budget_override if energy_budget_override is not None else config.get('energy_budget')
+    load_budget = load_budget_override if load_budget_override is not None else config.get('load_budget')
+    if energy_budget is None and load_budget is None:
+        print("[WARN] energy_budget/load_budget not provided; feasible will fall back to success.")
     
     # 观测配置（关键：必须与训练时一致）
     include_congestion_obs = config.get('include_congestion_obs', True)
@@ -307,6 +309,9 @@ def evaluate_fixed_set(
         or ("actor_backbone" in key)
         or ("reward_backbone" in key)
         or ("cost_backbone" in key)
+        or ("v_cost_total_head" in key)
+        or ("v_cost_head_shared" in key)
+        or ("v_all_head" in key)
         for key in state_dict.keys()
     )
     
@@ -317,7 +322,9 @@ def evaluate_fixed_set(
             obs_dim=obs_dim,
             act_dim=act_dim,
             hidden_dim=config.get('hidden_dim', 128),
-            cost_names=["energy", "load"]
+            cost_names=["energy", "load"],
+            cost_critic_mode=config.get("cost_critic_mode", "separate"),
+            value_head_mode=config.get("value_head_mode", "standard"),
         ).to(device)
     else:
         print("[INFO] Detected Single-Head network (Scalar PPO - V5 Baseline)")
@@ -531,6 +538,8 @@ def parse_args():
         "--device", type=str, default="cpu",
         help="Device to use (cpu or cuda)"
     )
+    parser.add_argument("--energy_budget", type=float, default=None, help="Override energy budget for feasibility check")
+    parser.add_argument("--load_budget", type=float, default=None, help="Override load budget for feasibility check")
     
     # 环境参数（可选，默认从 config.json 读取）
     parser.add_argument("--grid_size", type=int, default=8)
@@ -560,6 +569,8 @@ if __name__ == "__main__":
         device=args.device,
         deterministic=args.deterministic,
         out_csv=args.out_csv,
+        energy_budget_override=args.energy_budget,
+        load_budget_override=args.load_budget,
         grid_size=args.grid_size,
         step_penalty=args.step_penalty,
         success_reward=args.success_reward,

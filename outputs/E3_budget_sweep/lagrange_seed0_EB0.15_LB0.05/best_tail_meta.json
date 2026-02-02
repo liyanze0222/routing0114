@@ -1,0 +1,12 @@
+{
+  "iter": 243,
+  "tail_score": 1.876853307852378,
+  "energy_p95": 0.25,
+  "load_p95": 0.0938426653926189,
+  "feasible_success_rate": 0.36,
+  "avg_return": -2.22,
+  "window": 50,
+  "tail_percentile": 95.0,
+  "energy_budget": 0.15,
+  "load_budget": 0.05
+}
