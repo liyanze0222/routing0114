@@ -26,6 +26,7 @@ from grid_cost_env import GridCostWrapper
 from grid_hard_wrapper import GridHardWrapper
 from grid_congestion_obs_wrapper import GridCongestionObsWrapper
 from grid_energy_obs_wrapper import GridEnergyObsWrapper
+from grid_obs_norm_wrapper import GridObsNormWrapper
 from ppo_scalar import ScalarPPOConfig, ScalarPPO
 from utils import set_seed, MetricsLogger, plot_training_curves, make_output_dir
 
@@ -71,6 +72,10 @@ def parse_args():
         help="是否包含能耗观测"
     )
     parser.add_argument("--energy_patch_radius", type=int, default=1, help="能耗 patch 半径")
+    parser.add_argument(
+        "--obs_rms", type=lambda x: x.lower() == "true", default=False,
+        help="是否对全局观测做 RunningMeanStd 归一化"
+    )
     
     # ========== Cost Weights (关键参数) ==========
     parser.add_argument(
@@ -80,6 +85,24 @@ def parse_args():
     parser.add_argument(
         "--load_weight", type=float, default=0.0,
         help="Load cost 权重 β (scalar_reward = R - α*C_E - β*C_L)"
+    )
+
+    # ========== 起终点设置（与结构化脚本对齐） ==========
+    parser.add_argument(
+        "--start_goal_mode", type=str, default="random", choices=["random", "rect"],
+        help="起终点采样模式"
+    )
+    parser.add_argument("--start_rect", type=str, default=None, help="start_goal_mode=rect 时的起点矩形 r0,r1,c0,c1")
+    parser.add_argument("--goal_rect", type=str, default=None, help="start_goal_mode=rect 时的终点矩形 r0,r1,c0,c1")
+
+    # ========== 成本预算（与 Multi-Head 口径对齐） ==========
+    parser.add_argument(
+        "--energy_budget", type=float, default=0.10,
+        help="energy 成本预算（per-step 平均能耗上限）"
+    )
+    parser.add_argument(
+        "--load_budget", type=float, default=0.08,
+        help="load 成本预算（per-step 平均负载上限）"
     )
     
     # ========== PPO 超参 ==========
@@ -97,6 +120,19 @@ def parse_args():
     parser.add_argument("--run_tag", type=str, default=None, help="运行标签")
     parser.add_argument("--log_interval", type=int, default=10, help="日志间隔")
     parser.add_argument("--save_model", action="store_true", help="是否保存模型")
+
+    # ========== 最优模型存档（简化版） ==========
+    parser.add_argument(
+        "--enable_best_checkpoint", type=lambda x: x.lower() == "true", default=True,
+        help="是否启用最优可行/尾部风险模型存档"
+    )
+    parser.add_argument(
+        "--best_checkpoint_success_thresh", type=float, default=0.95,
+        help="Best checkpoint 生效所需的成功率下限"
+    )
+    parser.add_argument("--best_window_fsr", type=int, default=50, help="Best FSR 使用的窗口大小")
+    parser.add_argument("--best_window_tail", type=int, default=50, help="Tail-score 使用的窗口大小")
+    parser.add_argument("--tail_percentile", type=float, default=95.0, help="Tail-score 百分位")
     
     return parser.parse_args()
 
@@ -110,6 +146,9 @@ def _build_env(args):
         step_penalty=args.step_penalty,
         success_reward=args.success_reward,
         max_steps=max_steps,
+        start_goal_mode=args.start_goal_mode,
+        start_rect=args.start_rect,
+        goal_rect=args.goal_rect,
     )
     env = GridCostWrapper(
         base_env,
@@ -126,11 +165,49 @@ def _build_env(args):
         env = GridEnergyObsWrapper(
             env, patch_radius=args.energy_patch_radius
         )
+    if args.obs_rms:
+        env = GridObsNormWrapper(env)
     return env
+
+
+def _get_checkpoint_state(agent, meta=None):
+    """构造与 agent.save 对齐的 checkpoint 结构，并可附带元信息。"""
+    state = {
+        "network_state_dict": agent.network.state_dict(),
+        "optimizer_state_dict": agent.optimizer.state_dict() if hasattr(agent, "optimizer") else None,
+    }
+    if meta is not None:
+        state["meta"] = meta
+    return state
+
+
+def _parse_rect(rect_str: str | None, name: str, grid_size: int):
+    """Parse rect string "r0,r1,c0,c1" into a validated tuple within grid bounds."""
+    if rect_str is None:
+        return None
+    parts = [p.strip() for p in rect_str.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(f"{name} must be 'r0,r1,c0,c1', got: {rect_str}")
+    try:
+        r0, r1, c0, c1 = map(int, parts)
+    except ValueError as e:
+        raise ValueError(f"{name} must contain four integers: {rect_str}") from e
+    if not (0 <= r0 <= r1 < grid_size and 0 <= c0 <= c1 < grid_size):
+        raise ValueError(
+            f"{name} out of bounds for grid_size={grid_size}: {(r0, r1, c0, c1)}"
+        )
+    return (r0, r1, c0, c1)
 
 
 def main():
     args = parse_args()
+
+    # 解析 rect 参数（若提供）
+    try:
+        args.start_rect = _parse_rect(args.start_rect, "start_rect", args.grid_size)
+        args.goal_rect = _parse_rect(args.goal_rect, "goal_rect", args.grid_size)
+    except ValueError as e:
+        raise SystemExit(str(e))
     
     # 设置随机种子
     set_seed(args.seed)
@@ -194,12 +271,30 @@ def main():
     
     # 训练状态
     episode_returns: List[float] = []
+    episode_scalar_returns: List[float] = []
     episode_lengths: List[int] = []
     episode_successes: List[bool] = []
     
     # Episode 统计（用于计算 avg_cost）
     episode_energy_costs: List[float] = []
     episode_load_costs: List[float] = []
+
+    # 训练信息缓冲（用于窗口指标和最优 checkpoint 判定）
+    train_infos_buffer: List[Dict[str, Any]] = []
+
+    # 最优 checkpoint 追踪
+    best_fsr_value = -float("inf")
+    best_fsr_iter = None
+    best_fsr_return = -float("inf")
+    best_tail_value = float("inf")
+    best_tail_iter = None
+    best_tail_return = -float("inf")
+    best_tail_fsr = -float("inf")
+    
+    has_budget = (
+        args.energy_budget is not None and args.load_budget is not None
+        and args.energy_budget > 0 and args.load_budget > 0
+    )
     
     # 初始 reset
     obs, info = env.reset(seed=args.seed)
@@ -208,6 +303,7 @@ def main():
     
     # 训练循环
     ep_ret = 0.0
+    ep_scalar_ret = 0.0
     ep_len = 0
     ep_energy = 0.0
     ep_load = 0.0
@@ -238,6 +334,7 @@ def main():
             
             # *** 关键：Scalarize Reward ***
             scalar_reward = env_reward - args.energy_weight * energy_cost - args.load_weight * load_cost
+            ep_scalar_ret += scalar_reward
             
             # 收集数据（使用标量化的 reward）
             agent.collect_rollout(
@@ -263,10 +360,20 @@ def main():
             if done:
                 # Episode 结束
                 episode_returns.append(ep_ret)
+                episode_scalar_returns.append(ep_scalar_ret)
                 episode_lengths.append(ep_len)
                 episode_successes.append(terminated)
                 episode_energy_costs.append(ep_energy)
                 episode_load_costs.append(ep_load)
+
+                train_infos_buffer.append({
+                    "episode_return": ep_ret,
+                    "episode_scalar_return": ep_scalar_ret,
+                    "episode_length": ep_len,
+                    "episode_cost_energy": ep_energy,
+                    "episode_cost_load": ep_load,
+                    "success": bool(terminated),
+                })
                 
                 # Reset
                 obs, info = env.reset()
@@ -275,6 +382,7 @@ def main():
                 if current_map_fingerprint is not None:
                     map_fingerprints_iter.append(current_map_fingerprint)
                 ep_ret = 0.0
+                ep_scalar_ret = 0.0
                 ep_len = 0
                 ep_energy = 0.0
                 ep_load = 0.0
@@ -295,6 +403,7 @@ def main():
             
             # 计算统计量
             avg_return = np.mean(episode_returns[-100:]) if episode_returns else 0.0
+            avg_scalar_return = np.mean(episode_scalar_returns[-100:]) if episode_scalar_returns else 0.0
             avg_length = np.mean(episode_lengths[-100:]) if episode_lengths else 0.0
             success_rate = np.mean(episode_successes[-100:]) if episode_successes else 0.0
             
@@ -310,6 +419,9 @@ def main():
                 # Per-step mean
                 avg_cost_energy = np.mean([e / max(1, l) for e, l in zip(recent_energy, recent_lengths)])
                 avg_cost_load = np.mean([ld / max(1, l) for ld, l in zip(recent_load, recent_lengths)])
+
+            gap_energy = avg_cost_energy - args.energy_budget if has_budget else None
+            gap_load = avg_cost_load - args.load_budget if has_budget else None
             
             # 构造日志
             log_entry = {
@@ -317,10 +429,15 @@ def main():
                 "total_steps": total_steps,
                 "elapsed_time": elapsed,
                 "avg_return": float(avg_return),
+                "avg_scalar_return": float(avg_scalar_return),
                 "avg_length": float(avg_length),
                 "success_rate": float(success_rate),
                 "avg_cost_energy": float(avg_cost_energy),
                 "avg_cost_load": float(avg_cost_load),
+                "budget_energy": args.energy_budget,
+                "budget_load": args.load_budget,
+                "gap_energy": float(gap_energy) if gap_energy is not None else None,
+                "gap_load": float(gap_load) if gap_load is not None else None,
                 "policy_loss": metrics["policy_loss"],
                 "value_loss": metrics["value_loss"],
                 "entropy": metrics["entropy"],
@@ -340,6 +457,122 @@ def main():
             ]:
                 if key in metrics:
                     log_entry[key] = metrics[key]
+
+            # ========== 最优 checkpoint 判定（简化版） ==========
+            energy_pxx = None
+            load_pxx = None
+            tail_score = None
+            feasible_success_rate_window = None
+
+            if args.enable_best_checkpoint and has_budget and train_infos_buffer:
+                # 最近窗口的可行成功率（FSR）
+                window_fsr = args.best_window_fsr
+                episodes_window = train_infos_buffer if window_fsr <= 0 else train_infos_buffer[-window_fsr:]
+                feasible_success_count = 0
+                for ep in episodes_window:
+                    if not ep.get("success", False):
+                        continue
+                    ep_len = max(1, ep.get("episode_length", 1))
+                    e_mean = ep.get("episode_cost_energy", 0.0) / ep_len
+                    l_mean = ep.get("episode_cost_load", 0.0) / ep_len
+                    if e_mean <= args.energy_budget and l_mean <= args.load_budget:
+                        feasible_success_count += 1
+                feasible_success_rate_window = feasible_success_count / max(1, len(episodes_window))
+                window_returns = [ep.get("episode_return", 0.0) for ep in episodes_window]
+                avg_return_window = float(np.mean(window_returns)) if window_returns else 0.0
+
+                # 尾部风险指标（成功 episode 的 per-step cost 百分位）
+                tail_k = args.best_window_tail
+                success_eps = [ep for ep in train_infos_buffer if ep.get("success", False)]
+                if tail_k > 0:
+                    success_eps = success_eps[-tail_k:]
+                energy_rates = [ep.get("episode_cost_energy", 0.0) / max(1, ep.get("episode_length", 1)) for ep in success_eps]
+                load_rates = [ep.get("episode_cost_load", 0.0) / max(1, ep.get("episode_length", 1)) for ep in success_eps]
+                if energy_rates:
+                    energy_pxx = float(np.percentile(energy_rates, args.tail_percentile))
+                if load_rates:
+                    load_pxx = float(np.percentile(load_rates, args.tail_percentile))
+                if energy_pxx is not None and load_pxx is not None:
+                    tail_score = max(energy_pxx / args.energy_budget, load_pxx / args.load_budget)
+
+                success_reliable = success_rate >= args.best_checkpoint_success_thresh
+
+                # Best FSR
+                fsr_improved = (
+                    feasible_success_rate_window is not None
+                    and (
+                        feasible_success_rate_window > best_fsr_value + 1e-6
+                        or (
+                            abs(feasible_success_rate_window - best_fsr_value) < 1e-6
+                            and avg_return_window > best_fsr_return + 1e-6
+                        )
+                    )
+                )
+                if fsr_improved and success_reliable:
+                    best_fsr_value = feasible_success_rate_window
+                    best_fsr_iter = iteration
+                    best_fsr_return = avg_return_window
+                    torch.save(
+                        _get_checkpoint_state(
+                            agent,
+                            meta={
+                                "best_iter": best_fsr_iter,
+                                "best_fsr": best_fsr_value,
+                                "avg_return_window": best_fsr_return,
+                                "feasible_success_rate_window": feasible_success_rate_window,
+                                "tail_score": tail_score,
+                            },
+                        ),
+                        os.path.join(output_dir, "best_fsr.pt"),
+                    )
+                    print(f"[Best FSR] Updated at iter {iteration}: fsr={best_fsr_value:.4f}, return={best_fsr_return:.3f}")
+
+                # Best tail
+                if tail_score is not None:
+                    tail_improved = (
+                        tail_score < best_tail_value - 1e-6
+                        or (
+                            abs(tail_score - best_tail_value) < 1e-6
+                            and feasible_success_rate_window is not None
+                            and feasible_success_rate_window > best_tail_fsr + 1e-6
+                        )
+                        or (
+                            abs(tail_score - best_tail_value) < 1e-6
+                            and feasible_success_rate_window is not None
+                            and abs(feasible_success_rate_window - best_tail_fsr) < 1e-6
+                            and avg_return_window > best_tail_return + 1e-6
+                        )
+                    )
+                    if tail_improved and success_reliable:
+                        best_tail_value = tail_score
+                        best_tail_iter = iteration
+                        best_tail_return = avg_return_window
+                        best_tail_fsr = feasible_success_rate_window if feasible_success_rate_window is not None else best_tail_fsr
+                        fsr_display = feasible_success_rate_window if feasible_success_rate_window is not None else 0.0
+                        torch.save(
+                            _get_checkpoint_state(
+                                agent,
+                                meta={
+                                    "best_iter": best_tail_iter,
+                                    "best_tail_score": best_tail_value,
+                                    "avg_return_window": best_tail_return,
+                                    "feasible_success_rate_window": feasible_success_rate_window,
+                                    "energy_percentile": energy_pxx,
+                                    "load_percentile": load_pxx,
+                                },
+                            ),
+                            os.path.join(output_dir, "best_tail.pt"),
+                        )
+                        print(
+                            f"[Best Tail] Updated at iter {iteration}: tail_score={best_tail_value:.4f}, fsr={fsr_display:.4f}"
+                        )
+
+            log_entry["energy_percentile"] = energy_pxx
+            log_entry["load_percentile"] = load_pxx
+            log_entry["tail_score"] = tail_score
+            log_entry["feasible_success_rate_window"] = feasible_success_rate_window
+            log_entry["best_fsr_iter"] = best_fsr_iter
+            log_entry["best_tail_iter"] = best_tail_iter
             
             logger.log(log_entry)
             
@@ -347,7 +580,16 @@ def main():
             print("=" * 70)
             print(f"Iteration {iteration}/{args.total_iters} | Steps: {total_steps} | Time: {elapsed:.1f}s")
             print(f"Avg Return: {avg_return:.2f} | Avg Length: {avg_length:.1f} | Success Rate: {success_rate:.2%}")
-            print(f"Cost (energy): {avg_cost_energy:.4f} | Cost (load): {avg_cost_load:.4f}")
+            if gap_energy is not None and gap_load is not None:
+                print(
+                    f"Cost (energy): {avg_cost_energy:.4f} | Cost (load): {avg_cost_load:.4f} | "
+                    f"Gap: energy {gap_energy:+.4f}, load {gap_load:+.4f}"
+                )
+                print(
+                    f"Budget (per-step): energy {args.energy_budget:.4f} | load {args.load_budget:.4f}"
+                )
+            else:
+                print(f"Cost (energy): {avg_cost_energy:.4f} | Cost (load): {avg_cost_load:.4f}")
             print(f"Weights: α={args.energy_weight:.2f}, β={args.load_weight:.2f}")
             print("-" * 70)
             print(f"Policy Loss: {metrics['policy_loss']:.4f} | Value Loss: {metrics['value_loss']:.4f} | Entropy: {metrics['entropy']:.4f}")
@@ -359,7 +601,8 @@ def main():
     
     # 绘制曲线
     plot_path = os.path.join(output_dir, "training_curves.png")
-    plot_training_curves(logger.get_data(), plot_path)
+    plot_kwargs = {"best_iter": best_fsr_iter} if best_fsr_iter is not None else {}
+    plot_training_curves(logger.get_data(), plot_path, **plot_kwargs)
     print(f"Training curves saved to: {plot_path}")
     
     # 保存模型

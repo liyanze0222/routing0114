@@ -1,0 +1,105 @@
+--- /mnt/data/code/ppo_multi_agent.py.bak	2026-01-31 03:18:05.198945369 +0000
++++ /mnt/data/code/ppo_multi_agent.py	2026-01-31 03:20:44.656551593 +0000
+@@ -1201,42 +1201,78 @@
+                         # 未到更新频率，日志仍保留 gbar 与 corr
+                         gap_used_for_update.update({name: 0.0 for name in self.cost_names})
+ 
+-                # ====== standard 模式：projected dual ascent（不使用 EMA，直接用 raw gap）======
++                # ====== standard 模式：projected dual ascent（支持 D1-D8，对齐 args）======
+                 else:
+-                    if should_update_lambda:
++                    # 1) 可选：gap EMA（D1）。注意：这里的 EMA 只用于对偶更新与日志，
++                    # 不改变 cost 的统计口径（avg_cost 仍是 batch 平均）。
++                    beta = float(getattr(self.cfg, "lambda_gap_ema_beta", 0.0) or 0.0)
++                    use_gap_ema = beta > 0.0
++
++                    # 先决定“用于更新/日志的 gap”（EMA 或 raw）
++                    for name in self.cost_names:
++                        g_raw = float(gap_for_mode.get(name, 0.0))
++                        if use_gap_ema:
++                            self.ema_gaps[name] = (1.0 - beta) * float(self.ema_gaps.get(name, 0.0)) + beta * g_raw
++                            g_for_update = float(self.ema_gaps[name])
++                        else:
++                            g_for_update = g_raw
++                        gap_ema_for_log[name] = float(g_for_update)
++
++                    # 2) D2：两时间尺度（lambda_update_freq）
++                    if not should_update_lambda:
+                         for name in self.cost_names:
+-                            g_raw = float(gap_for_mode.get(name, 0.0))
+-                            
+-                            # standard 模式不使用 EMA，直接用 raw gap 更新
+-                            g_used = g_raw
++                            gap_used_for_update[name] = 0.0
++                    else:
++                        for name in self.cost_names:
++                            g_signed = float(gap_ema_for_log.get(name, 0.0))
++
++                            # D3 + D7 + D8：deadzone（支持 per-cost 与非对称 deadzone）
++                            dz = float(getattr(self.cfg, "lambda_deadzone", 0.0) or 0.0)
++                            dz_map = getattr(self.cfg, "lambda_deadzones", None)
++                            if isinstance(dz_map, dict):
++                                dz = float(dz_map.get(name, dz))
++
++                            dz_up = getattr(self.cfg, "lambda_deadzone_up", None)
++                            dz_down = getattr(self.cfg, "lambda_deadzone_down", None)
++                            if g_signed > 0.0 and dz_up is not None:
++                                dz = float(dz_up)
++                            elif g_signed < 0.0 and dz_down is not None:
++                                dz = float(dz_down)
++
++                            if dz > 0.0 and abs(g_signed) < dz:
++                                gap_used_for_update[name] = 0.0
++                                continue
+ 
+-                            # per-cost lr：优先 lambda_lr_energy / lambda_lr_load，再回退到已有逻辑
++                            # per-cost base lr：优先 lambda_lr_energy / lambda_lr_load，再回退到 lambda_lrs / lambda_lr
+                             if name == "energy":
+-                                lr = getattr(self.cfg, "lambda_lr_energy", None)
++                                base_lr = getattr(self.cfg, "lambda_lr_energy", None)
+                             else:
+-                                lr = getattr(self.cfg, "lambda_lr_load", None)
++                                base_lr = getattr(self.cfg, "lambda_lr_load", None)
+ 
+-                            if lr is None:
++                            if base_lr is None:
+                                 if self.cfg.lambda_lrs is not None:
+-                                    lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
++                                    base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                                 else:
+-                                    lr = self.cfg.lambda_lr
++                                    base_lr = self.cfg.lambda_lr
++                            base_lr = float(base_lr)
+ 
+-                            new_lambda = max(
+-                                0.0,
+-                                float(self.lambdas.get(name, 0.0)) + float(lr) * float(g_used),
+-                            )
++                            # D5-D6：非对称学习率（up / down）
++                            lr_up = float(self.cfg.lambda_lr_up) if self.cfg.lambda_lr_up is not None else base_lr
++                            lr_down = float(self.cfg.lambda_lr_down) if self.cfg.lambda_lr_down is not None else base_lr
++                            if g_signed > 0.0:
++                                lr = lr_up
++                            elif g_signed < 0.0:
++                                lr = lr_down
++                            else:
++                                lr = base_lr
++
++                            # projected ascent + D4：lambda_max
++                            new_lambda = max(0.0, float(self.lambdas.get(name, 0.0)) + lr * g_signed)
+                             if self.cfg.lambda_max is not None:
+                                 new_lambda = min(new_lambda, float(self.cfg.lambda_max))
+ 
+-                            self.lambdas[name] = new_lambda
+-                            gap_used_for_update[name] = float(g_used)
+-                            gap_ema_for_log[name] = float(g_used)  # standard 模式下 EMA 等于 raw
+-                    else:
+-                        # 未到更新频率
+-                        for name in self.cost_names:
+-                            gap_ema_for_log[name] = float(gap_for_mode.get(name, 0.0))
+-                            gap_used_for_update[name] = 0.0
++                            self.lambdas[name] = float(new_lambda)
++                            gap_used_for_update[name] = float(g_signed)
+ 
+         # ========== 6. 构造返回的 metrics ==========
+         denom = max(update_steps, 1)

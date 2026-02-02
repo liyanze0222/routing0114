@@ -354,6 +354,10 @@ def parse_args():
         help="B: Best FSR 使用的窗口大小（最近 W 个 episode，可行率 tie-breaker 对齐）"
     )
     parser.add_argument(
+        "--train_buffer_episodes", type=int, default=100,
+        help="训练期用于统计指标的 episode ring-buffer 长度（默认 100）。注意 best_window_fsr 必须 <= 该值。"
+    )
+    parser.add_argument(
         "--best_window_tail", type=int, default=50,
         help="B: Tail-score 使用的最近成功 episode 数（默认 50）"
     )
@@ -631,6 +635,12 @@ def main():
             and (args.start_rect[2] == args.start_rect[3])
         ):
             raise ValueError("start_rect and goal_rect collapse to the same single cell; cannot ensure start!=goal")
+
+    # 口径保护：best_window_fsr 不应大于 ring-buffer 长度
+    if args.train_buffer_episodes > 0 and args.best_window_fsr > args.train_buffer_episodes:
+        raise ValueError(
+            f"--best_window_fsr ({args.best_window_fsr}) must be <= --train_buffer_episodes ({args.train_buffer_episodes})"
+        )
 
     # 设置随机种子
     set_seed(args.seed)
@@ -1028,9 +1038,10 @@ def main():
                     'episode_cost_load': ep_cost_load,
                 }
                 train_infos_buffer.append(ep_info)
-                # 保留最近 100 个 episodes
-                if len(train_infos_buffer) > 100:
-                    train_infos_buffer = train_infos_buffer[-100:]
+                # 保留最近 N 个 episodes（用于 metrics 统计）
+                max_buf_eps = int(getattr(args, "train_buffer_episodes", 100))
+                if max_buf_eps > 0 and len(train_infos_buffer) > max_buf_eps:
+                    train_infos_buffer = train_infos_buffer[-max_buf_eps:]
 
                 ep_ret, ep_len = 0.0, 0
                 ep_cost_energy, ep_cost_load = 0.0, 0.0
@@ -1140,6 +1151,17 @@ def main():
         ]:
             if key in metrics:
                 log_entry[key] = metrics[key]
+        # 新增：absolute gap 口径（与 PPO 日志对齐），若存在则补充
+        for key in [
+            "gap_abs_energy",
+            "gap_abs_load",
+            "gap_abs_energy_ema",
+            "gap_abs_load_ema",
+            "gap_abs_energy_used",
+            "gap_abs_load_used",
+        ]:
+            if key in metrics:
+                log_entry[key] = metrics[key]
         for key in metrics:
             if key.startswith("dual_precond_"):
                 log_entry[key] = metrics[key]
@@ -1148,6 +1170,18 @@ def main():
             log_entry["ema_gap_energy"] = metrics["ema_gap_energy"]
         if "ema_gap_load" in metrics:
             log_entry["ema_gap_load"] = metrics["ema_gap_load"]
+        # aggregated 模式的额外指标（若存在则写入）
+        for key in [
+            "cost_total_mean",
+            "cost_total_budget",
+            "gap_total",
+            "gap_ratio_total",
+            "lambda_total",
+            "kkt_total",
+            "ema_gap_total",
+        ]:
+            if key in metrics:
+                log_entry[key] = metrics[key]
         
         # [新增] 添加诊断指标到 log_entry（在 logger.log 之前）
         # 1. Safety Gym 风格累计成本率：rho_* = cumulative_cost / total_steps
@@ -1184,6 +1218,14 @@ def main():
                 log_entry[key] = metrics[key]
         
         # 3. 计算 Safety Gym episode 指标
+        log_entry["avg_energy_success"] = 0.0
+        log_entry["avg_load_success"] = 0.0
+        log_entry["feasible_success_rate"] = 0.0
+        log_entry["feasible_success_rate_buffer"] = 0.0
+        log_entry["feasible_given_success"] = 0.0
+        log_entry["feasible_success_count"] = 0
+        log_entry["num_success_episodes"] = 0
+        log_entry["num_episodes_buffer"] = len(train_infos_buffer)
         if len(train_infos_buffer) > 0:
             success_episodes = [info for info in train_infos_buffer if info.get('success', False)]
             
@@ -1211,12 +1253,18 @@ def main():
             log_entry["avg_energy_success"] = avg_energy_success
             log_entry["avg_load_success"] = avg_load_success
             log_entry["feasible_success_rate"] = feasible_success_rate
+            log_entry["feasible_success_rate_buffer"] = feasible_success_rate
             log_entry["feasible_given_success"] = feasible_given_success
             log_entry["feasible_success_count"] = feasible_success_count
             log_entry["num_success_episodes"] = len(success_episodes)
             log_entry["num_episodes_buffer"] = len(train_infos_buffer)
 
         # ========== B2: Best FSR / Tail 计算与存档 ==========
+        # 口径保护：best_window_fsr 不应大于 buffer 长度
+        max_buf_eps = int(getattr(args, "train_buffer_episodes", 100))
+        if max_buf_eps > 0 and args.best_window_fsr > max_buf_eps:
+            raise ValueError(f"--best_window_fsr ({args.best_window_fsr}) must be <= --train_buffer_episodes ({max_buf_eps})")
+
         window_fsr = args.best_window_fsr
         episodes_window = train_infos_buffer if window_fsr <= 0 else train_infos_buffer[-window_fsr:]
         has_window_data = len(episodes_window) > 0
@@ -1233,6 +1281,11 @@ def main():
         feasible_success_rate_window = feasible_success_count_w / max(1, len(episodes_window))
         window_returns = [ep['episode_return'] for ep in episodes_window]
         avg_return_window = float(np.mean(window_returns)) if window_returns else 0.0
+
+        # 写入 window 口径指标，避免 metrics vs meta 混淆
+        log_entry["best_window_fsr"] = int(window_fsr)
+        log_entry["feasible_success_rate_window"] = float(feasible_success_rate_window)
+        log_entry["avg_return_window"] = float(avg_return_window)
 
         tail_k = args.best_window_tail
         success_tail_eps = [ep for ep in train_infos_buffer if ep.get('success', False)]
