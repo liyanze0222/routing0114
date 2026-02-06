@@ -592,3 +592,60 @@ def plot_safety_gym_curves(data: List[Dict[str, Any]], save_path: str):
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"[INFO] Safety Gym curves saved to {save_path}")
+
+
+def augment_obs_with_context(
+    obs: np.ndarray,
+    energy_budget: float,
+    load_budget: float,
+    lambdas: dict,
+    include_budget: bool,
+    include_lambda: bool,
+    lambda_clip: Optional[float] = None
+) -> np.ndarray:
+    """
+    将观测向量与上下文信息（预算和拉格朗日乘子）拼接。
+
+    Args:
+        obs: 原始观测向量 (np.ndarray)
+        energy_budget: 能量预算 (float)
+        load_budget: 负载预算 (float)
+        lambdas: 拉格朗日乘子字典，至少包含 "energy" 和 "load" 键
+        include_budget: 是否包含预算信息
+        include_lambda: 是否包含拉格朗日乘子信息
+        lambda_clip: 对 lambda 特征进行裁剪的上限值（None 则不裁剪）
+
+    Returns:
+        拼接后的观测向量 (np.ndarray, dtype=float32)
+
+    拼接顺序：
+        [obs, (beta_E, beta_L if include_budget), (lambda_E, lambda_L if include_lambda)]
+    """
+    # 确保 obs 是 float32
+    obs_flat = obs.flatten().astype(np.float32)
+    
+    # 收集需要拼接的特征
+    features = [obs_flat]
+    
+    # 添加预算信息
+    if include_budget:
+        beta_E = np.array([energy_budget], dtype=np.float32)
+        beta_L = np.array([load_budget], dtype=np.float32)
+        features.extend([beta_E, beta_L])
+    
+    # 添加拉格朗日乘子信息
+    if include_lambda:
+        lambda_E = np.array([lambdas["energy"]], dtype=np.float32)
+        lambda_L = np.array([lambdas["load"]], dtype=np.float32)
+        
+        # 如果指定了 lambda_clip，进行裁剪
+        if lambda_clip is not None:
+            lambda_E = np.clip(lambda_E, -lambda_clip, lambda_clip)
+            lambda_L = np.clip(lambda_L, -lambda_clip, lambda_clip)
+        
+        features.extend([lambda_E, lambda_L])
+    
+    # 拼接所有特征
+    augmented_obs = np.concatenate(features, axis=0)
+    
+    return augmented_obs.astype(np.float32)

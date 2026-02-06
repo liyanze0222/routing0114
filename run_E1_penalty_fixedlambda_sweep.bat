@@ -70,8 +70,13 @@ set "LOG_ACTOR_GRAD_DECOMP=False"
 set "GRAD_DECOMP_INTERVAL=100"
 set "LOG_INTERVAL=10"
 
+REM ---- S4: window/buffer consistency (adjust if your code uses a different arg name) ----
+set "TRAIN_BUFFER_EPISODES=100"
+
 REM ---- Seeds ----
-for %%S in (0) do (
+set "SEEDS=0 1 2"
+
+for %%S in (%SEEDS%) do (
   for %%E in (0.1 0.5 1.0 2.0 5.0) do (
     for %%L in (0.1 0.5 1.0 2.0 5.0) do (
 
@@ -81,7 +86,7 @@ for %%S in (0) do (
 
       python %SCRIPT% ^
         --output_dir "%OUTDIR%" ^
-        --run_tag "penalty_fixed_seed%%S_lE%%E_lL%%L" ^
+        --run_tag "penalty_seed%%S_EB%E_BUDGET%_LB%L_BUDGET%_lamE%%E_lamL%%L" ^
         --seed %%S ^
         --total_iters %ITERS% ^
         --batch_size %BATCH% ^
@@ -145,11 +150,11 @@ for %%S in (0) do (
         --log_actor_decomp %LOG_ACTOR_DECOMP% ^
         --log_actor_grad_decomp %LOG_ACTOR_GRAD_DECOMP% ^
         --grad_decomp_interval %GRAD_DECOMP_INTERVAL% ^
-        --log_interval %LOG_INTERVAL%
+        --log_interval %LOG_INTERVAL% ^
+        --train_buffer_episodes %TRAIN_BUFFER_EPISODES%
 
     )
   )
 )
-
 echo Done.
 pause

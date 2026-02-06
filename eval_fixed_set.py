@@ -13,6 +13,8 @@ from grid_env import GridRoutingEnv
 from grid_cost_env import GridCostWrapper
 from grid_hard_wrapper import GridHardWrapper
 from networks import MultiHeadActorCritic
+from ppo_multi_agent import MultiCriticPPOConfig, MultiCriticPPO
+from utils import augment_obs_with_context
 from grid_congestion_obs_wrapper import GridCongestionObsWrapper
 from grid_energy_obs_wrapper import GridEnergyObsWrapper
 from grid_obs_norm_wrapper import GridObsNormWrapper
@@ -34,6 +36,15 @@ def _get_action_mask(env):
 
 def _str2bool(val: str) -> bool:
     return str(val).lower() in {"1", "true", "yes"}
+
+
+def _resolve_device(device: str) -> str:
+    """Return a usable device string; downgrade to cpu if CUDA is unavailable."""
+    dev = str(device).lower()
+    if dev.startswith("cuda") and not torch.cuda.is_available():
+        print("[WARN] Requested CUDA but torch has no CUDA support; fallback to cpu")
+        return "cpu"
+    return device
 
 
 def _parse_rect(val):
@@ -202,6 +213,10 @@ def evaluate_fixed_set(
     out_csv: str = None,
     energy_budget_override: Optional[float] = None,
     load_budget_override: Optional[float] = None,
+    online_dual_update: bool = False,
+    eval_init_lambda_energy: Optional[float] = None,
+    eval_init_lambda_load: Optional[float] = None,
+    eval_lambda_min: Optional[float] = None,
     # 环境参数（可从 config 覆盖）
     grid_size: int = 8,
     step_penalty: float = -1.0,
@@ -210,6 +225,11 @@ def evaluate_fixed_set(
     congestion_pattern: str = "block",
     congestion_density: float = 0.40,
     energy_high_density: float = 0.20,
+    eval_congestion_pattern: Optional[str] = None,
+    eval_congestion_density: Optional[float] = None,
+    eval_energy_high_density: Optional[float] = None,
+    eval_load_threshold: Optional[float] = None,
+    eval_randomize_maps_each_reset: Optional[bool] = None,
     patch_radius: int = 2,
     start_goal_mode: Optional[str] = None,
     start_rect: Optional[Tuple[int, int, int, int]] = None,
@@ -217,9 +237,28 @@ def evaluate_fixed_set(
     record_trajectory: bool = False,
     out_npz: Optional[str] = None,
     save_trajectory_json: Optional[str] = None,
+    eval_lambda_lr: Optional[float] = None,
+    eval_lambda_update_freq: Optional[int] = None,
+    eval_lambda_max: Optional[float] = None,
+    eval_lambda_gap_mode: Optional[str] = None,
+    eval_dual_deadband: Optional[float] = None,
+    eval_lambda_obs_clip: Optional[float] = None,
+    reset_lambdas_each_episode: bool = False,
+    dual_trace_csv: Optional[str] = None,
+    budget_schedule_csv: Optional[str] = None,
+    budget_schedule_mode: str = "cycle",
 ):
+    device = _resolve_device(device)
+
     # 尝试从 checkpoint 目录加载配置
     config = load_config_from_dir(model_path)
+
+    # 策略条件化开关（默认关闭以保持兼容）
+    policy_condition_on_lambda = bool(config.get("policy_condition_on_lambda", False))
+    policy_condition_on_budget = bool(config.get("policy_condition_on_budget", False))
+    lambda_obs_clip = config.get("lambda_obs_clip", None)
+    if lambda_obs_clip is None and config.get("lambda_max") is not None:
+        lambda_obs_clip = config.get("lambda_max")
     
     # 从 config 中读取环境参数（如果存在）
     grid_size = config.get('grid_size', grid_size)
@@ -237,6 +276,20 @@ def evaluate_fixed_set(
     load_budget = load_budget_override if load_budget_override is not None else config.get('load_budget')
     if energy_budget is None and load_budget is None:
         print("[WARN] energy_budget/load_budget not provided; feasible will fall back to success.")
+
+    # Eval-time overrides for env-related settings
+    if eval_congestion_pattern is not None:
+        congestion_pattern = eval_congestion_pattern
+    if eval_congestion_density is not None:
+        congestion_density = float(eval_congestion_density)
+    if eval_energy_high_density is not None:
+        energy_high_density = float(eval_energy_high_density)
+    if eval_load_threshold is not None:
+        load_threshold = float(eval_load_threshold)
+    if eval_randomize_maps_each_reset is not None:
+        randomize_maps_each_reset = bool(eval_randomize_maps_each_reset)
+    else:
+        randomize_maps_each_reset = config.get('randomize_maps_each_reset', False)
     
     # 观测配置（关键：必须与训练时一致）
     include_congestion_obs = config.get('include_congestion_obs', True)
@@ -253,10 +306,10 @@ def evaluate_fixed_set(
     print(f"Start/Goal: mode={start_goal_mode}, start_rect={start_rect}, goal_rect={goal_rect}")
     print(f"Observation: Congestion={include_congestion_obs} (r={congestion_patch_radius}), "
           f"Energy={include_energy_obs} (r={energy_patch_radius})")
+    print(f"Randomize maps each reset: {randomize_maps_each_reset}")
     print("=" * 50 + "\n")
 
-    # 评估保持固定地图（默认不在 reset 重采样）
-    randomize_maps_each_reset = False
+    # 评估保持固定地图（默认不在 reset 重采样，若提供 eval 覆盖则使用）
     
     # 1. 配置与训练一致的环境
     def make_env(seed):
@@ -292,13 +345,17 @@ def evaluate_fixed_set(
     # 2. 加载模型（支持 Multi-Head 和 Scalar 两种架构）
     temp_env = make_env(0)
     obs_sample, _ = temp_env.reset(seed=0)
-    obs_dim = obs_sample.shape[0] if hasattr(obs_sample, 'shape') else len(obs_sample)
+    base_obs_dim = obs_sample.shape[0] if hasattr(obs_sample, 'shape') else len(obs_sample)
+    context_dim = (2 if policy_condition_on_budget else 0) + (2 if policy_condition_on_lambda else 0)
+    obs_dim = base_obs_dim + context_dim
     act_dim = temp_env.action_space.n
     temp_env.close()
     
     # 🔧 检测网络类型：从 checkpoint 中判断是 Multi-Head 还是 Scalar
     # PyTorch 2.6 defaulted torch.load to weights_only=True; allow full objects for trusted checkpoints
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    # map checkpoint to a valid device; fallback to CPU if CUDA is unavailable
+    target_device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+    checkpoint = torch.load(model_path, map_location=target_device, weights_only=False)
     state_dict = checkpoint.get("network_state_dict", checkpoint.get("model_state_dict", checkpoint))
     
     # 判断依据：Multi-Head 有 v_cost_heads / actor_backbone / reward_backbone 等前缀
@@ -317,15 +374,81 @@ def evaluate_fixed_set(
     
     if is_multi_head:
         print("[INFO] Detected Multi-Head network (Lagrangian PPO)")
-        from networks import MultiHeadActorCritic
-        agent = MultiHeadActorCritic(
+
+        energy_budget_val = energy_budget if energy_budget is not None else config.get('energy_budget', 0.0)
+        load_budget_val = load_budget if load_budget is not None else config.get('load_budget', 0.0)
+
+        mcfg = MultiCriticPPOConfig(
             obs_dim=obs_dim,
             act_dim=act_dim,
             hidden_dim=config.get('hidden_dim', 128),
-            cost_names=["energy", "load"],
+            cost_budgets={"energy": energy_budget_val, "load": load_budget_val},
             cost_critic_mode=config.get("cost_critic_mode", "separate"),
             value_head_mode=config.get("value_head_mode", "standard"),
-        ).to(device)
+            agg_cost_w_energy=config.get("agg_cost_w_energy", 1.0),
+            agg_cost_w_load=config.get("agg_cost_w_load", 1.0),
+            agg_cost_normalize_by_budget=config.get("agg_cost_normalize_by_budget", True),
+            lambda_lr=config.get("lambda_lr", 0.01),
+            lambda_lrs=config.get("lambda_lrs"),
+            lambda_gap_mode=config.get("lambda_gap_mode", "absolute"),
+            dual_update_mode=config.get("dual_update_mode", "standard"),
+            dual_gap_ema_beta=config.get("dual_gap_ema_beta", 0.10),
+            dual_deadband=config.get("dual_deadband", 0.02),
+            dual_lr_down_scale=config.get("dual_lr_down_scale", 0.20),
+            dual_corr_ema_beta=config.get("dual_corr_ema_beta", 0.05),
+            dual_precond_eps=config.get("dual_precond_eps", 0.05),
+            dual_precond_clip=config.get("dual_precond_clip", 2.0),
+            dual_precond_strength=config.get("dual_precond_strength", 0.3),
+            dual_precond_use_ema_stats=config.get("dual_precond_use_ema_stats", True),
+            lambda_gap_ema_beta=config.get("lambda_gap_ema_beta", 0.0),
+            lambda_update_freq=config.get("lambda_update_freq", 1),
+            lambda_deadzone=config.get("lambda_deadzone", 0.0),
+            lambda_max=config.get("lambda_max", None),
+            lambda_lr_up=config.get("lambda_lr_up", None),
+            lambda_lr_down=config.get("lambda_lr_down", None),
+            lambda_deadzones=config.get("lambda_deadzones", None),
+            lambda_deadzone_up=config.get("lambda_deadzone_up", None),
+            lambda_deadzone_down=config.get("lambda_deadzone_down", None),
+            risk_factor=config.get("risk_factor", 0.0),
+            update_lambdas=False,  # 由 online_dual_update 控制
+            device=device,
+        )
+        agent = MultiCriticPPO(mcfg)  # MultiCriticPPO is not an nn.Module; do not call .to()
+        agent.network.to(device)
+        agent.network.load_state_dict(state_dict)
+        agent.lambdas = checkpoint.get("lambdas", {"energy": 0.0, "load": 0.0})
+        if eval_init_lambda_energy is not None:
+            agent.lambdas["energy"] = float(eval_init_lambda_energy)
+        if eval_init_lambda_load is not None:
+            agent.lambdas["load"] = float(eval_init_lambda_load)
+        agent.cfg.policy_condition_on_budget = policy_condition_on_budget
+        agent.cfg.policy_condition_on_lambda = policy_condition_on_lambda
+        agent.cfg.lambda_obs_clip = lambda_obs_clip
+        agent.cfg.update_lambdas = online_dual_update
+
+        # -------- Eval overrides (do NOT affect checkpoint) --------
+        if eval_lambda_lr is not None:
+            agent.cfg.lambda_lr = float(eval_lambda_lr)
+            agent.cfg.lambda_lr_energy = float(eval_lambda_lr)
+            agent.cfg.lambda_lr_load = float(eval_lambda_lr)
+
+        if eval_lambda_update_freq is not None:
+            agent.cfg.lambda_update_freq = int(eval_lambda_update_freq)
+
+        if eval_lambda_max is not None:
+            agent.cfg.lambda_max = float(eval_lambda_max)
+
+        if eval_lambda_gap_mode is not None:
+            agent.cfg.lambda_gap_mode = str(eval_lambda_gap_mode)
+
+        if eval_dual_deadband is not None:
+            agent.cfg.dual_deadband = float(eval_dual_deadband)
+
+        if eval_lambda_obs_clip is not None:
+            agent.cfg.lambda_obs_clip = float(eval_lambda_obs_clip)
+
+        lambdas_init_eval = dict(agent.lambdas)
+        dual_trace_rows = []
     else:
         print("[INFO] Detected Single-Head network (Scalar PPO - V5 Baseline)")
         from networks import ActorCritic
@@ -334,11 +457,42 @@ def evaluate_fixed_set(
             act_dim=act_dim,
             hidden_dim=config.get('hidden_dim', 128)
         ).to(device)
-    
-    agent.load_state_dict(state_dict)
-    agent.eval()
+        agent.load_state_dict(state_dict)
+
+    if is_multi_head:
+        agent.network.eval()
+    else:
+        agent.eval()
+
+    lambdas_init_eval = locals().get("lambdas_init_eval", None)
+    dual_trace_rows = locals().get("dual_trace_rows", [])
 
     results = []
+
+    budget_schedule_mode = (budget_schedule_mode or "cycle").lower()
+    if budget_schedule_mode not in {"cycle", "sequential"}:
+        raise ValueError("budget_schedule_mode must be 'cycle' or 'sequential'")
+
+    budget_schedule = None
+    if budget_schedule_csv is not None:
+        if not os.path.exists(budget_schedule_csv):
+            raise FileNotFoundError(f"Budget schedule CSV not found: {budget_schedule_csv}")
+        df_sched = pd.read_csv(budget_schedule_csv)
+        eb_col = next((c for c in df_sched.columns if c.lower() in {"energy_budget", "eb"}), None)
+        lb_col = next((c for c in df_sched.columns if c.lower() in {"load_budget", "lb"}), None)
+        if eb_col is None and lb_col is None:
+            raise ValueError("Budget schedule CSV must contain energy_budget/load_budget or EB/LB columns")
+        budget_schedule = []
+        for _, row in df_sched.iterrows():
+            eb_val = row[eb_col] if eb_col is not None else np.nan
+            lb_val = row[lb_col] if lb_col is not None else np.nan
+            eb_val = None if pd.isna(eb_val) else float(eb_val)
+            lb_val = None if pd.isna(lb_val) else float(lb_val)
+            budget_schedule.append((eb_val, lb_val))
+        if len(budget_schedule) == 0:
+            budget_schedule = None
+        if budget_schedule is not None:
+            print(f"[INFO] Loaded budget schedule with {len(budget_schedule)} entries from {budget_schedule_csv}")
 
     record_outputs = record_trajectory or (out_npz is not None) or (save_trajectory_json is not None)
     visit_counts = np.zeros((grid_size, grid_size), dtype=np.int64) if record_outputs else None
@@ -353,6 +507,23 @@ def evaluate_fixed_set(
         env = make_env(seed)
         inject_obs_stats(env, checkpoint, config)
         obs, _ = env.reset(seed=seed)
+
+        # Apply per-episode budget from schedule if provided
+        if budget_schedule:
+            if budget_schedule_mode == "sequential":
+                idx = min(i, len(budget_schedule) - 1)
+            else:  # default: cycle
+                idx = i % len(budget_schedule)
+            energy_budget_ep, load_budget_ep = budget_schedule[idx]
+        else:
+            energy_budget_ep, load_budget_ep = energy_budget, load_budget
+
+        if is_multi_head:
+            agent.cfg.cost_budgets["energy"] = energy_budget_ep if energy_budget_ep is not None else agent.cfg.cost_budgets.get("energy", 0.0)
+            agent.cfg.cost_budgets["load"] = load_budget_ep if load_budget_ep is not None else agent.cfg.cost_budgets.get("load", 0.0)
+
+        if is_multi_head and reset_lambdas_each_episode and lambdas_init_eval is not None:
+            agent.lambdas = dict(lambdas_init_eval)
 
         cost_wrapper = find_cost_wrapper(env)
         energy_map = getattr(cost_wrapper, "_energy_map", None) if cost_wrapper is not None else None
@@ -385,22 +556,42 @@ def evaluate_fixed_set(
         ep_len = 0
         success = False
         feasible = False
+        ep_energy_list: List[float] = []
+        ep_load_list: List[float] = []
         
         while not done:
             with torch.no_grad():
-                obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
                 mask = _get_action_mask(env)
-                mask_t = None
-                if mask is not None:
-                    mask_t = torch.as_tensor(mask, dtype=torch.float32).unsqueeze(0).to(device)
-                
-                action = _select_action(
-                    agent=agent,
-                    obs_t=obs_t,
-                    mask_t=mask_t,
-                    is_multi_head=is_multi_head,
-                    deterministic=deterministic,
-                )
+                mask_arr = np.array(mask, dtype=bool) if mask is not None else None
+
+                if is_multi_head:
+                    obs_in = augment_obs_with_context(
+                        obs,
+                        energy_budget_ep if energy_budget_ep is not None else config.get('energy_budget', 0.0),
+                        load_budget_ep if load_budget_ep is not None else config.get('load_budget', 0.0),
+                        agent.lambdas,
+                        include_budget=policy_condition_on_budget,
+                        include_lambda=policy_condition_on_lambda,
+                        lambda_clip=getattr(agent.cfg, "lambda_obs_clip", lambda_obs_clip),
+                    )
+                    obs_t = torch.as_tensor(obs_in, dtype=torch.float32).unsqueeze(0).to(device)
+                    mask_t = torch.as_tensor(mask_arr, dtype=torch.bool).unsqueeze(0).to(device) if mask_arr is not None else None
+                    if deterministic:
+                        logits, _, _ = agent.network.forward(obs_t, action_mask=mask_t)
+                        action = int(torch.argmax(logits, dim=-1).item())
+                    else:
+                        # select_action returns (action, log_prob, v_reward, v_costs)
+                        action, _, _, _ = agent.select_action(obs_in, action_mask=mask_arr)
+                else:
+                    obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+                    mask_t = torch.as_tensor(mask_arr, dtype=torch.float32).unsqueeze(0).to(device) if mask_arr is not None else None
+                    action = _select_action(
+                        agent=agent,
+                        obs_t=obs_t,
+                        mask_t=mask_t,
+                        is_multi_head=is_multi_head,
+                        deterministic=deterministic,
+                    )
             
             obs, reward, done, truncated, info = env.step(action)
             
@@ -410,6 +601,8 @@ def evaluate_fixed_set(
             
             ep_energy += step_energy
             ep_load += step_load
+            ep_energy_list.append(step_energy)
+            ep_load_list.append(step_load)
             total_reward += reward
             ep_len += 1
             
@@ -440,11 +633,36 @@ def evaluate_fixed_set(
         if record_outputs:
             trajectory_records[seed] = traj
 
-        feasible = success
-        if energy_budget is not None:
-            feasible = feasible and (ep_energy / max(1, ep_len) <= energy_budget)
-        if load_budget is not None:
-            feasible = feasible and (ep_load / max(1, ep_len) <= load_budget)
+        energy_ok = True if energy_budget_ep is None else (ep_energy / max(1, ep_len) <= energy_budget_ep)
+        load_ok = True if load_budget_ep is None else (ep_load / max(1, ep_len) <= load_budget_ep)
+        cost_feasible = energy_ok and load_ok
+        feasible = success and cost_feasible
+
+        if is_multi_head and getattr(agent.cfg, "update_lambdas", False):
+            lamb_before = dict(agent.lambdas)
+            dual_metrics = agent.dual_update_only({"energy": ep_energy_list, "load": ep_load_list})
+            lamb_after = dict(agent.lambdas)
+
+            if eval_lambda_min is not None:
+                lam_min = float(eval_lambda_min)
+                for k in agent.lambdas:
+                    agent.lambdas[k] = max(lam_min, agent.lambdas[k])
+
+            if dual_trace_csv is not None:
+                row = {
+                    "seed": seed,
+                    "success": success,
+                    "ep_len": ep_len,
+                    "energy_budget": float(energy_budget_ep) if energy_budget_ep is not None else np.nan,
+                    "load_budget": float(load_budget_ep) if load_budget_ep is not None else np.nan,
+                    "lambda_energy_before": lamb_before.get("energy", 0.0),
+                    "lambda_load_before": lamb_before.get("load", 0.0),
+                    "lambda_energy_after": lamb_after.get("energy", 0.0),
+                    "lambda_load_after": lamb_after.get("load", 0.0),
+                }
+                for k, v in dual_metrics.items():
+                    row[k] = v
+                dual_trace_rows.append(row)
         
         results.append({
             "seed": seed,
@@ -485,6 +703,10 @@ def evaluate_fixed_set(
     if out_csv:
         df.to_csv(out_csv, index=False)
         print(f"\n[INFO] Results saved to {out_csv}")
+
+    if dual_trace_csv is not None and len(dual_trace_rows) > 0:
+        pd.DataFrame(dual_trace_rows).to_csv(dual_trace_csv, index=False)
+        print(f"[INFO] Dual trace saved to {dual_trace_csv}")
 
     if record_outputs:
         total_visits = visit_counts.sum()
@@ -540,6 +762,20 @@ def parse_args():
     )
     parser.add_argument("--energy_budget", type=float, default=None, help="Override energy budget for feasibility check")
     parser.add_argument("--load_budget", type=float, default=None, help="Override load budget for feasibility check")
+    parser.add_argument("--online_dual_update", type=_str2bool, nargs="?", const=True, default=False, help="If True, run dual_update_only online during eval")
+    parser.add_argument("--eval_init_lambda_energy", type=float, default=None, help="Optional override for initial lambda_energy during eval")
+    parser.add_argument("--eval_init_lambda_load", type=float, default=None, help="Optional override for initial lambda_load during eval")
+    parser.add_argument("--eval_lambda_min", type=float, default=None, help="Clamp lambdas to this minimum after online dual updates")
+
+    # --- Eval overrides / debugging ---
+    parser.add_argument("--eval_lambda_lr", type=float, default=None, help="Override lambda_lr during eval (online dual only)")
+    parser.add_argument("--eval_lambda_update_freq", type=int, default=None, help="Override lambda_update_freq during eval")
+    parser.add_argument("--eval_lambda_max", type=float, default=None, help="Override lambda_max during eval")
+    parser.add_argument("--eval_lambda_gap_mode", type=str, default=None, choices=["absolute", "ratio"], help="Override lambda_gap_mode during eval")
+    parser.add_argument("--eval_dual_deadband", type=float, default=None, help="Override dual_deadband during eval")
+    parser.add_argument("--eval_lambda_obs_clip", type=float, default=None, help="Override lambda_obs_clip used in obs augmentation during eval")
+    parser.add_argument("--reset_lambdas_each_episode", type=_str2bool, nargs="?", const=True, default=False, help="If True, reset lambdas to initial value at each episode start (diagnose drift)")
+    parser.add_argument("--dual_trace_csv", type=str, default=None, help="If set, save per-episode dual diagnostics to this CSV")
     
     # 环境参数（可选，默认从 config.json 读取）
     parser.add_argument("--grid_size", type=int, default=8)
@@ -549,6 +785,11 @@ def parse_args():
     parser.add_argument("--congestion_pattern", type=str, default="block")
     parser.add_argument("--congestion_density", type=float, default=0.40)
     parser.add_argument("--energy_high_density", type=float, default=0.20)
+    parser.add_argument("--eval_congestion_pattern", type=str, default=None, help="Eval-time override for congestion pattern")
+    parser.add_argument("--eval_congestion_density", type=float, default=None, help="Eval-time override for congestion density")
+    parser.add_argument("--eval_energy_high_density", type=float, default=None, help="Eval-time override for high energy density")
+    parser.add_argument("--eval_load_threshold", type=float, default=None, help="Eval-time override for load threshold")
+    parser.add_argument("--eval_randomize_maps_each_reset", type=_str2bool, nargs="?", const=True, default=None, help="Eval-time override for map randomization per reset")
     parser.add_argument("--patch_radius", type=int, default=2)
     parser.add_argument("--record_trajectory", type=_str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--out_npz", type=str, default=None)
@@ -556,6 +797,8 @@ def parse_args():
     parser.add_argument("--start_goal_mode", type=str, default=None)
     parser.add_argument("--start_rect", type=str, default=None)
     parser.add_argument("--goal_rect", type=str, default=None)
+    parser.add_argument("--budget_schedule_csv", type=str, default=None, help="CSV containing per-episode energy/load budgets (columns: energy_budget/load_budget or EB/LB)")
+    parser.add_argument("--budget_schedule_mode", type=str, default="cycle", choices=["cycle", "sequential"], help="How to traverse the budget schedule across episodes")
     
     return parser.parse_args()
 
@@ -571,6 +814,18 @@ if __name__ == "__main__":
         out_csv=args.out_csv,
         energy_budget_override=args.energy_budget,
         load_budget_override=args.load_budget,
+        online_dual_update=args.online_dual_update,
+        eval_init_lambda_energy=args.eval_init_lambda_energy,
+        eval_init_lambda_load=args.eval_init_lambda_load,
+        eval_lambda_min=args.eval_lambda_min,
+        eval_lambda_lr=args.eval_lambda_lr,
+        eval_lambda_update_freq=args.eval_lambda_update_freq,
+        eval_lambda_max=args.eval_lambda_max,
+        eval_lambda_gap_mode=args.eval_lambda_gap_mode,
+        eval_dual_deadband=args.eval_dual_deadband,
+        eval_lambda_obs_clip=args.eval_lambda_obs_clip,
+        reset_lambdas_each_episode=args.reset_lambdas_each_episode,
+        dual_trace_csv=args.dual_trace_csv,
         grid_size=args.grid_size,
         step_penalty=args.step_penalty,
         success_reward=args.success_reward,
@@ -578,6 +833,11 @@ if __name__ == "__main__":
         congestion_pattern=args.congestion_pattern,
         congestion_density=args.congestion_density,
         energy_high_density=args.energy_high_density,
+        eval_congestion_pattern=args.eval_congestion_pattern,
+        eval_congestion_density=args.eval_congestion_density,
+        eval_energy_high_density=args.eval_energy_high_density,
+        eval_load_threshold=args.eval_load_threshold,
+        eval_randomize_maps_each_reset=args.eval_randomize_maps_each_reset,
         patch_radius=args.patch_radius,
         start_goal_mode=args.start_goal_mode,
         start_rect=_parse_rect(args.start_rect),
@@ -585,4 +845,6 @@ if __name__ == "__main__":
         record_trajectory=args.record_trajectory,
         out_npz=args.out_npz,
         save_trajectory_json=args.save_trajectory_json,
+        budget_schedule_csv=args.budget_schedule_csv,
+        budget_schedule_mode=args.budget_schedule_mode,
     )
