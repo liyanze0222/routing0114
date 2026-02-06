@@ -1,0 +1,13 @@
+{
+  "seed": 1,
+  "energy_budget": 0.1,
+  "load_budget": 0.05,
+  "metric": "best_feasible_return",
+  "best_dir": "penalty_seed1_EB0.10_LB0.05_lamE0.5_lamL1.0",
+  "score": -1.6,
+  "best_fsr_value": 0.7,
+  "lambdaconsidered": {
+    "energy": 0.5,
+    "load": 1.0
+  }
+}

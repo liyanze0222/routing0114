@@ -1460,6 +1460,501 @@ class MultiCriticPPO:
 
         return metrics
 
+    def dual_update_only(self, costs_window: Dict[str, List[float]]) -> Dict[str, float]:
+        """仅执行对偶(λ)更新，不触碰策略/价值网络参数。
+
+        Args:
+            costs_window: 过去窗口内每步的成本序列，包含 "energy" 和 "load"。
+
+        Returns:
+            metrics: 仅包含成本、gap、lambda 相关的诊断指标。
+        """
+        if costs_window is None or not all(k in costs_window for k in ("energy", "load")):
+            raise ValueError("costs_window must contain 'energy' and 'load'")
+
+        # 将输入转换为数组（允许额外 key，但只使用已知 cost_names）
+        cost_arrays: Dict[str, np.ndarray] = {}
+        for name in self.cost_names:
+            vals = costs_window.get(name, [])
+            cost_arrays[name] = np.array(list(vals), dtype=np.float32)
+
+        avg_costs: Dict[str, float] = {}
+        gaps: Dict[str, float] = {}
+        ratio_gaps: Dict[str, float] = {}
+        std_costs: Dict[str, float] = {}
+        risk_costs: Dict[str, float] = {}
+        risk_gaps: Dict[str, float] = {}
+        risk_ratio_gaps: Dict[str, float] = {}
+
+        # ========== 计算成本统计量（与 update() 第 5 步保持口径一致） ==========
+        if self.is_aggregated_mode:
+            energy_arr = cost_arrays.get("energy", np.array([], dtype=np.float32))
+            load_arr = cost_arrays.get("load", np.array([], dtype=np.float32))
+            if energy_arr.shape[0] != load_arr.shape[0]:
+                raise ValueError("energy and load sequences must have the same length for aggregated mode")
+
+            if self.cfg.agg_cost_normalize_by_budget:
+                energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
+                load_budget = self.cfg.cost_budgets.get("load", 1.0)
+                total_cost_vals = (
+                    self.cfg.agg_cost_w_energy * (energy_arr / np.maximum(energy_budget, 1e-8))
+                    + self.cfg.agg_cost_w_load * (load_arr / np.maximum(load_budget, 1e-8))
+                )
+            else:
+                total_cost_vals = (
+                    self.cfg.agg_cost_w_energy * energy_arr
+                    + self.cfg.agg_cost_w_load * load_arr
+                )
+
+            avg_cost_total = float(total_cost_vals.mean()) if total_cost_vals.size > 0 else 0.0
+            std_cost_total = float(total_cost_vals.std()) if total_cost_vals.size > 0 else 0.0
+
+            if self.cfg.agg_cost_normalize_by_budget:
+                wsum = self.cfg.agg_cost_w_energy + self.cfg.agg_cost_w_load
+                total_budget = wsum if wsum > 1e-8 else 1.0
+            else:
+                energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
+                load_budget = self.cfg.cost_budgets.get("load", 1.0)
+                total_budget = self.cfg.agg_cost_w_energy * energy_budget + self.cfg.agg_cost_w_load * load_budget
+
+            gap_total = avg_cost_total - total_budget
+            ratio_gap_total = (avg_cost_total / max(total_budget, 1e-8)) - 1.0
+
+            risk_cost_total = avg_cost_total + self.cfg.risk_factor * std_cost_total
+            risk_gap_total = risk_cost_total - total_budget
+            risk_ratio_gap_total = (risk_cost_total / max(total_budget, 1e-8)) - 1.0
+
+            for name in self.cost_names:
+                arr = cost_arrays.get(name, np.array([], dtype=np.float32))
+                avg_val = float(arr.mean()) if arr.size > 0 else 0.0
+                std_val = float(arr.std()) if arr.size > 0 else 0.0
+                avg_costs[name] = avg_val
+                std_costs[name] = std_val
+                budget = self.cfg.cost_budgets.get(name, 0.0)
+                gaps[name] = avg_val - budget
+                denom = budget if budget > 0 else 1.0
+                ratio_gaps[name] = (avg_val / (denom + 1e-8)) - 1.0
+                risk_cost = avg_val + self.cfg.risk_factor * std_val
+                risk_costs[name] = risk_cost
+                risk_gaps[name] = risk_cost - budget
+                risk_ratio_gaps[name] = (risk_cost / (denom + 1e-8)) - 1.0
+        else:
+            for name in self.cost_names:
+                arr = cost_arrays.get(name, np.array([], dtype=np.float32))
+                avg_val = float(arr.mean()) if arr.size > 0 else 0.0
+                std_val = float(arr.std()) if arr.size > 0 else 0.0
+                avg_costs[name] = avg_val
+                std_costs[name] = std_val
+                budget = self.cfg.cost_budgets.get(name, 0.0)
+                gaps[name] = avg_val - budget
+                denom = budget if budget > 0 else 1.0
+                ratio_gaps[name] = (avg_val / (denom + 1e-8)) - 1.0
+                risk_cost = avg_val + self.cfg.risk_factor * std_val
+                risk_costs[name] = risk_cost
+                risk_gaps[name] = risk_cost - budget
+                risk_ratio_gaps[name] = (risk_cost / (denom + 1e-8)) - 1.0
+
+        # ========== Dual 更新（复刻 update() 的第 5 步逻辑） ==========
+        update_lambdas = bool(getattr(self.cfg, "update_lambdas", False))
+        self.cfg.update_lambdas = update_lambdas
+
+        self._iter_count += 1
+
+        gap_used_for_update: Dict[str, float] = {name: 0.0 for name in self.cost_names}
+        gap_ema_for_log: Dict[str, float] = {}
+        corr_gap_for_log = 0.0
+        precond_diag: Dict[str, float] = {}
+        decor_diag: Dict[str, float] = {}
+
+        if self.is_aggregated_mode:
+            if self.cfg.lambda_gap_mode == "ratio":
+                gap_total_used = risk_ratio_gap_total
+                gap_ema_for_log["total"] = risk_ratio_gap_total
+            else:
+                gap_total_used = risk_gap_total
+                gap_ema_for_log["total"] = risk_gap_total
+
+            if update_lambdas:
+                should_update_lambda = (self._iter_count % self.cfg.lambda_update_freq == 0)
+                if self.cfg.lambda_lrs is not None:
+                    base_lr = self.cfg.lambda_lrs.get("energy", self.cfg.lambda_lr)
+                else:
+                    base_lr = self.cfg.lambda_lr
+
+                dual_mode = self.cfg.dual_update_mode
+                if dual_mode in ("decorrelated", "precond", "preconditioned"):
+                    dual_mode = "hysteresis"
+
+                if dual_mode in ("hysteresis", "both"):
+                    g_raw = float(gap_total_used)
+                    beta_gap = self.cfg.dual_gap_ema_beta
+                    if beta_gap > 0:
+                        self.dual_gap_ema["energy"] = (1 - beta_gap) * self.dual_gap_ema["energy"] + beta_gap * g_raw
+                        g_ema = self.dual_gap_ema["energy"]
+                    else:
+                        g_ema = g_raw
+                    gap_ema_for_log["total"] = g_ema
+
+                    g_used = g_raw if g_raw > 0 else g_ema
+                    if abs(g_used) <= self.cfg.dual_deadband:
+                        g_used = 0.0
+
+                    if should_update_lambda and g_used != 0.0:
+                        lr_up = self.cfg.lambda_lr_up if self.cfg.lambda_lr_up is not None else base_lr
+                        step_lr = lr_up if g_used > 0 else lr_up * self.cfg.dual_lr_down_scale
+                        new_lambda = self.lambdas["energy"] + step_lr * g_used
+                        new_lambda = max(0.0, new_lambda)
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+                        self.lambdas["energy"] = new_lambda
+                        gap_used_for_update["energy"] = g_used
+                    else:
+                        gap_used_for_update["energy"] = 0.0
+
+                    gap_used_for_update["load"] = 0.0
+                    self.lambdas["load"] = 0.0
+                else:
+                    effective_gap = gap_total_used
+                    if self.cfg.lambda_gap_ema_beta > 0:
+                        beta = self.cfg.lambda_gap_ema_beta
+                        self.ema_gaps["energy"] = (1 - beta) * self.ema_gaps.get("energy", 0.0) + beta * effective_gap
+                        effective_gap = self.ema_gaps["energy"]
+                    gap_ema_for_log["total"] = effective_gap
+
+                    deadzone = self.cfg.lambda_deadzone
+                    if deadzone > 0 and abs(effective_gap) < deadzone:
+                        effective_gap = 0.0
+
+                    if should_update_lambda:
+                        new_lambda = max(0.0, self.lambdas["energy"] + base_lr * effective_gap)
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+                        self.lambdas["energy"] = new_lambda
+                        gap_used_for_update["energy"] = effective_gap
+                    else:
+                        gap_used_for_update["energy"] = 0.0
+
+                    gap_used_for_update["load"] = 0.0
+                    self.lambdas["load"] = 0.0
+        else:
+            gap_for_mode = risk_ratio_gaps if self.cfg.lambda_gap_mode == "ratio" else risk_gaps
+
+            if update_lambdas and self.cfg.dual_update_mode != "standard":
+                beta_gap = self.cfg.dual_gap_ema_beta
+                dual_gbar: Dict[str, float] = {}
+                for name in self.cost_names:
+                    if beta_gap > 0:
+                        self.dual_gap_ema[name] = (1 - beta_gap) * self.dual_gap_ema[name] + beta_gap * gap_for_mode[name]
+                        dual_gbar[name] = self.dual_gap_ema[name]
+                    else:
+                        dual_gbar[name] = gap_for_mode[name]
+                    gap_ema_for_log[name] = dual_gbar[name]
+
+                has_e_l = {"energy", "load"}.issubset(set(self.cost_names))
+                corr_gap_for_log = 0.0
+                varE = varL = covEL = 0.0
+                gE = dual_gbar.get("energy", 0.0)
+                gL = dual_gbar.get("load", 0.0)
+                dual_source = dual_gbar
+
+                if has_e_l and self.cfg.dual_update_mode in ("decorrelated", "both", "precond", "preconditioned"):
+                    b = self.cfg.dual_corr_ema_beta
+                    use_ema_stats = self.cfg.dual_precond_use_ema_stats or self.cfg.dual_update_mode in ("decorrelated", "both")
+
+                    meanE = self.dual_corr_state["mean"]["energy"]
+                    meanL = self.dual_corr_state["mean"]["load"]
+                    if use_ema_stats:
+                        meanE = (1 - b) * meanE + b * gE
+                        meanL = (1 - b) * meanL + b * gL
+                        varE = (1 - b) * self.dual_corr_state["var"]["energy"] + b * (gE - meanE) ** 2
+                        varL = (1 - b) * self.dual_corr_state["var"]["load"] + b * (gL - meanL) ** 2
+                        covEL = (1 - b) * self.dual_corr_state["cov"] + b * (gE - meanE) * (gL - meanL)
+
+                        self.dual_corr_state["mean"]["energy"] = meanE
+                        self.dual_corr_state["mean"]["load"] = meanL
+                        self.dual_corr_state["var"]["energy"] = varE
+                        self.dual_corr_state["var"]["load"] = varL
+                        self.dual_corr_state["cov"] = covEL
+                    else:
+                        varE = gE * gE
+                        varL = gL * gL
+                        covEL = gE * gL
+
+                    denom = varE * varL
+                    if self.cfg.dual_update_mode in ("decorrelated", "both"):
+                        if denom < 1e-8:
+                            corr_gap_for_log = 0.0
+                        else:
+                            corr_gap_for_log = float(np.clip(covEL / np.sqrt(denom + 1e-8), -0.95, 0.95))
+
+                if has_e_l and self.cfg.dual_update_mode in ("precond", "preconditioned"):
+                    eps = float(self.cfg.dual_precond_eps)
+                    clip_val = float(self.cfg.dual_precond_clip)
+                    strength = float(self.cfg.dual_precond_strength)
+
+                    gE = float(dual_gbar.get("energy", 0.0))
+                    gL = float(dual_gbar.get("load", 0.0))
+                    a = float(varE)
+                    b_val = float(varL)
+                    c = float(covEL)
+
+                    fallback = 0
+                    det = float("nan")
+                    cond_approx = 1.0
+
+                    g_pre_energy = gE
+                    g_pre_load = gL
+
+                    if not (np.isfinite(a) and np.isfinite(b_val) and np.isfinite(c)):
+                        fallback = 1
+                    else:
+                        a_eps = a + eps
+                        b_eps = b_val + eps
+                        det = a_eps * b_eps - c * c
+
+                        if (not np.isfinite(det)) or det <= 1e-12:
+                            fallback = 1
+                            inv_a = 1.0 / max(a_eps, 1e-12)
+                            inv_b = 1.0 / max(b_eps, 1e-12)
+                            g_pre_energy = inv_a * gE
+                            g_pre_load = inv_b * gL
+                        else:
+                            inv00 = b_eps / det
+                            inv01 = -c / det
+                            inv11 = a_eps / det
+
+                            g_pre_energy = inv00 * gE + inv01 * gL
+                            g_pre_load = inv01 * gE + inv11 * gL
+
+                            tr = a_eps + b_eps
+                            disc = (a_eps - b_eps) ** 2 + 4.0 * c * c
+                            sqrt_disc = float(np.sqrt(max(disc, 0.0)))
+                            eig_max = 0.5 * (tr + sqrt_disc)
+                            eig_min = max(0.5 * (tr - sqrt_disc), 1e-12)
+                            cond_approx = float(eig_max / eig_min)
+
+                    g_used_energy_raw = (1.0 - strength) * gE + strength * g_pre_energy
+                    g_used_load_raw = (1.0 - strength) * gL + strength * g_pre_load
+
+                    g_used_energy = float(np.clip(g_used_energy_raw, -clip_val, clip_val))
+                    g_used_load = float(np.clip(g_used_load_raw, -clip_val, clip_val))
+
+                    clip_hit_energy = 1.0 if abs(g_used_energy) >= clip_val - 1e-12 else 0.0
+                    clip_hit_load = 1.0 if abs(g_used_load) >= clip_val - 1e-12 else 0.0
+                    self.dual_clip_hist.append((clip_hit_energy, clip_hit_load))
+                    if len(self.dual_clip_hist) > 200:
+                        self.dual_clip_hist.pop(0)
+                    clip_rate_energy = float(np.mean([x[0] for x in self.dual_clip_hist])) if self.dual_clip_hist else 0.0
+                    clip_rate_load = float(np.mean([x[1] for x in self.dual_clip_hist])) if self.dual_clip_hist else 0.0
+
+                    dual_source = dual_gbar.copy()
+                    dual_source["energy"] = g_used_energy
+                    dual_source["load"] = g_used_load
+
+                    shrink_E = (g_used_energy / (gE + 1e-8)) if abs(gE) > 1e-12 else 0.0
+                    shrink_L = (g_used_load / (gL + 1e-8)) if abs(gL) > 1e-12 else 0.0
+
+                    precond_diag = {
+                        "dual_precond_var_energy": float(a),
+                        "dual_precond_var_load": float(b_val),
+                        "dual_precond_cov_el": float(c),
+                        "dual_precond_det": float(det),
+                        "dual_precond_cond_approx": float(cond_approx),
+                        "dual_precond_gpre_energy": float(g_pre_energy),
+                        "dual_precond_gpre_load": float(g_pre_load),
+                        "dual_precond_clip_energy": float(clip_hit_energy),
+                        "dual_precond_clip_load": float(clip_hit_load),
+                        "dual_precond_clip_rate_energy": float(clip_rate_energy),
+                        "dual_precond_clip_rate_load": float(clip_rate_load),
+                        "dual_precond_shrink_energy": float(shrink_E),
+                        "dual_precond_shrink_load": float(shrink_L),
+                        "dual_precond_fallback": float(fallback),
+                    }
+
+                if self.cfg.dual_update_mode in ("decorrelated", "both") and has_e_l:
+                    reg_eps = 1e-8
+                    beta_e_on_l = (covEL / (varL + reg_eps)) if varL > 1e-12 else 0.0
+                    beta_l_on_e = (covEL / (varE + reg_eps)) if varE > 1e-12 else 0.0
+                    beta_clip = 5.0
+                    beta_e_on_l = float(np.clip(beta_e_on_l, -beta_clip, beta_clip))
+                    beta_l_on_e = float(np.clip(beta_l_on_e, -beta_clip, beta_clip))
+
+                    gtilde_energy = dual_gbar["energy"] - beta_e_on_l * dual_gbar["load"]
+                    gtilde_load = dual_gbar["load"] - beta_l_on_e * dual_gbar["energy"]
+
+                    dual_source = dual_gbar.copy()
+                    dual_source["energy"] = gtilde_energy
+                    dual_source["load"] = gtilde_load
+
+                    decor_diag = {
+                        "dual_decor_beta_e_on_l": float(beta_e_on_l),
+                        "dual_decor_beta_l_on_e": float(beta_l_on_e),
+                    }
+
+                should_update_lambda = (self._iter_count % self.cfg.lambda_update_freq == 0)
+                if should_update_lambda:
+                    for name in self.cost_names:
+                        if name == "energy":
+                            base_lr = getattr(self.cfg, "lambda_lr_energy", None)
+                        else:
+                            base_lr = getattr(self.cfg, "lambda_lr_load", None)
+                        if base_lr is None:
+                            if self.cfg.lambda_lrs is not None:
+                                base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                            else:
+                                base_lr = self.cfg.lambda_lr
+
+                        if self.cfg.dual_update_mode in ("hysteresis", "both"):
+                            g_raw = float(gap_for_mode.get(name, 0.0))
+                            g_ema = dual_source.get(name, dual_gbar[name])
+
+                            if g_raw > 0:
+                                g_val = g_raw
+                            else:
+                                g_val = g_ema
+                                if abs(g_val) <= self.cfg.dual_deadband:
+                                    gap_used_for_update[name] = 0.0
+                                    continue
+
+                            lr_up = self.cfg.lambda_lr_up if self.cfg.lambda_lr_up is not None else base_lr
+                            step_lr = lr_up if g_val > 0 else lr_up * self.cfg.dual_lr_down_scale
+                            new_lambda = max(0.0, self.lambdas[name] + step_lr * g_val)
+                            gap_used_for_update[name] = g_val
+                        else:
+                            g_val = dual_source.get(name, dual_gbar[name])
+                            lr = base_lr
+                            new_lambda = max(0.0, self.lambdas[name] + lr * g_val)
+                            gap_used_for_update[name] = g_val
+
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, self.cfg.lambda_max)
+                        self.lambdas[name] = new_lambda
+                else:
+                    gap_used_for_update.update({name: 0.0 for name in self.cost_names})
+
+            elif update_lambdas:
+                beta = float(getattr(self.cfg, "lambda_gap_ema_beta", 0.0) or 0.0)
+                use_gap_ema = beta > 0.0
+
+                for name in self.cost_names:
+                    g_raw = float(gap_for_mode.get(name, 0.0))
+                    if use_gap_ema:
+                        self.ema_gaps[name] = (1.0 - beta) * float(self.ema_gaps.get(name, 0.0)) + beta * g_raw
+                        g_for_update = float(self.ema_gaps[name])
+                    else:
+                        g_for_update = g_raw
+                    gap_ema_for_log[name] = float(g_for_update)
+
+                if self._iter_count % self.cfg.lambda_update_freq == 0:
+                    for name in self.cost_names:
+                        g_signed = float(gap_ema_for_log.get(name, 0.0))
+
+                        dz = float(getattr(self.cfg, "lambda_deadzone", 0.0) or 0.0)
+                        dz_map = getattr(self.cfg, "lambda_deadzones", None)
+                        if isinstance(dz_map, dict):
+                            dz = float(dz_map.get(name, dz))
+
+                        dz_up = getattr(self.cfg, "lambda_deadzone_up", None)
+                        dz_down = getattr(self.cfg, "lambda_deadzone_down", None)
+                        if g_signed > 0.0 and dz_up is not None:
+                            dz = float(dz_up)
+                        elif g_signed < 0.0 and dz_down is not None:
+                            dz = float(dz_down)
+
+                        if dz > 0.0 and abs(g_signed) < dz:
+                            gap_used_for_update[name] = 0.0
+                            continue
+
+                        if name == "energy":
+                            base_lr = getattr(self.cfg, "lambda_lr_energy", None)
+                        else:
+                            base_lr = getattr(self.cfg, "lambda_lr_load", None)
+                        if base_lr is None:
+                            if self.cfg.lambda_lrs is not None:
+                                base_lr = self.cfg.lambda_lrs.get(name, self.cfg.lambda_lr)
+                            else:
+                                base_lr = self.cfg.lambda_lr
+                        base_lr = float(base_lr)
+
+                        lr_up = float(self.cfg.lambda_lr_up) if self.cfg.lambda_lr_up is not None else base_lr
+                        lr_down = float(self.cfg.lambda_lr_down) if self.cfg.lambda_lr_down is not None else base_lr
+                        if g_signed > 0.0:
+                            lr = lr_up
+                        elif g_signed < 0.0:
+                            lr = lr_down
+                        else:
+                            lr = base_lr
+
+                        new_lambda = max(0.0, float(self.lambdas.get(name, 0.0)) + lr * g_signed)
+                        if self.cfg.lambda_max is not None:
+                            new_lambda = min(new_lambda, float(self.cfg.lambda_max))
+
+                        self.lambdas[name] = float(new_lambda)
+                        gap_used_for_update[name] = float(g_signed)
+                else:
+                    gap_used_for_update.update({name: 0.0 for name in self.cost_names})
+
+        # ========== 构造返回的 metrics ==========
+        metrics: Dict[str, float] = {}
+
+        for name in self.cost_names:
+            metrics[f"avg_cost_{name}"] = avg_costs.get(name, 0.0)
+            metrics[f"std_cost_{name}"] = std_costs.get(name, 0.0)
+            metrics[f"gap_{name}"] = gaps.get(name, 0.0)
+            metrics[f"gap_ratio_{name}"] = ratio_gaps.get(name, 0.0)
+            metrics[f"risk_cost_{name}"] = risk_costs.get(name, 0.0)
+            metrics[f"risk_gap_{name}"] = risk_gaps.get(name, 0.0)
+            metrics[f"risk_gap_ratio_{name}"] = risk_ratio_gaps.get(name, 0.0)
+            metrics[f"lambda_{name}"] = self.lambdas.get(name, 0.0)
+            metrics[f"kkt_{name}"] = self.lambdas.get(name, 0.0) * gaps.get(name, 0.0)
+            metrics[f"risk_kkt_{name}"] = self.lambdas.get(name, 0.0) * risk_gaps.get(name, 0.0)
+            if self.cfg.lambda_gap_ema_beta > 0:
+                metrics[f"ema_gap_{name}"] = self.ema_gaps.get(name, 0.0)
+            metrics[f"gap_used_{name}"] = gap_used_for_update.get(name, 0.0)
+
+        if self.is_aggregated_mode:
+            metrics["cost_total_mean"] = avg_cost_total
+            metrics["cost_total_std"] = std_cost_total
+            if self.cfg.agg_cost_normalize_by_budget:
+                wsum = self.cfg.agg_cost_w_energy + self.cfg.agg_cost_w_load
+                metrics["cost_total_budget"] = wsum if wsum > 1e-8 else 1.0
+            else:
+                energy_budget = self.cfg.cost_budgets.get("energy", 1.0)
+                load_budget = self.cfg.cost_budgets.get("load", 1.0)
+                metrics["cost_total_budget"] = self.cfg.agg_cost_w_energy * energy_budget + self.cfg.agg_cost_w_load * load_budget
+            metrics["gap_total"] = gap_total
+            metrics["gap_ratio_total"] = ratio_gap_total
+            metrics["risk_gap_total"] = risk_gap_total
+            metrics["risk_gap_ratio_total"] = risk_ratio_gap_total
+            metrics["lambda_total"] = self.lambdas.get("energy", 0.0)
+            metrics["kkt_total"] = self.lambdas.get("energy", 0.0) * gap_total
+            metrics["risk_kkt_total"] = self.lambdas.get("energy", 0.0) * risk_gap_total
+            if self.cfg.lambda_gap_ema_beta > 0:
+                metrics["ema_gap_total"] = gap_ema_for_log.get("total", 0.0)
+
+        if {"energy", "load"}.issubset(set(self.cost_names)) and not self.is_aggregated_mode:
+            metrics["gap_abs_energy"] = gaps.get("energy", 0.0)
+            metrics["gap_abs_load"] = gaps.get("load", 0.0)
+            metrics["gap_ratio_energy"] = ratio_gaps.get("energy", 0.0)
+            metrics["gap_ratio_load"] = ratio_gaps.get("load", 0.0)
+            metrics["gap_abs_energy_ema"] = gap_ema_for_log.get("energy", ratio_gaps.get("energy", 0.0))
+            metrics["gap_abs_load_ema"] = gap_ema_for_log.get("load", ratio_gaps.get("load", 0.0))
+            metrics["gap_abs_energy_used"] = gap_used_for_update.get("energy", 0.0)
+            metrics["gap_abs_load_used"] = gap_used_for_update.get("load", 0.0)
+            metrics["corr_gap_ema"] = corr_gap_for_log
+            metrics["risk_gap_ratio_energy"] = risk_ratio_gaps.get("energy", 0.0)
+            metrics["risk_gap_ratio_load"] = risk_ratio_gaps.get("load", 0.0)
+
+            if precond_diag:
+                metrics.update(precond_diag)
+            if decor_diag:
+                metrics.update(decor_diag)
+
+        metrics["lambda_gap_mode"] = self.cfg.lambda_gap_mode
+        metrics["update_lambdas_effective"] = bool(update_lambdas)
+
+        return metrics
+
     # ==================== 模型保存/加载 ====================
 
     def save(self, path: str):

@@ -1,9 +1,0 @@
-episode,seed,policy,success,feasible,total_reward,total_energy,total_load,gap_energy,gap_load,ep_len,map_hash
-0,0,lagrange,False,False,-256.0,260.0,8.447434343397617,258.8,7.947434343397617,256,aa74fb6b7b9c44ffe6afa0679b28787a
-0,0,reward_only,False,False,-256.0,256.0,267.90300369262695,254.8,267.40300369262695,256,aa74fb6b7b9c44ffe6afa0679b28787a
-1,1,lagrange,True,False,16.0,6.0,0.0,4.8,-0.5,4,291ea0aca42a0f6d7e4525e5597afb70
-1,1,reward_only,False,False,-256.0,258.0,655.5034630000591,256.8,655.0034630000591,256,291ea0aca42a0f6d7e4525e5597afb70
-2,2,lagrange,False,False,-256.0,256.0,0.0,254.8,-0.5,256,388a28a35811138125f5fadcfe62a1ca
-2,2,reward_only,False,False,-256.0,256.0,0.0,254.8,-0.5,256,388a28a35811138125f5fadcfe62a1ca
-3,3,lagrange,False,False,-256.0,258.0,0.0,256.8,-0.5,256,43bdacbca851c9d2ed8bf8888c630ba5
-3,3,reward_only,False,False,-256.0,258.0,0.0,256.8,-0.5,256,43bdacbca851c9d2ed8bf8888c630ba5

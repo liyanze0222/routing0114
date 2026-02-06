@@ -51,7 +51,7 @@ from grid_congestion_obs_wrapper import GridCongestionObsWrapper
 from grid_energy_obs_wrapper import GridEnergyObsWrapper
 from grid_obs_norm_wrapper import GridObsNormWrapper
 from ppo_multi_agent import MultiCriticPPOConfig, MultiCriticPPO
-from utils import set_seed, MetricsLogger, plot_training_curves, plot_safety_gym_curves, make_output_dir, save_grid_route_viz
+from utils import set_seed, MetricsLogger, plot_training_curves, plot_safety_gym_curves, make_output_dir, save_grid_route_viz, augment_obs_with_context
 # from check_cost_units import run_cost_unit_check  # Optional module
 
 
@@ -434,6 +434,20 @@ def parse_args():
     parser.add_argument("--vis_episodes", type=int, default=1, help="每次保存可视化跑多少条 episode（不同 seed=vis_seed+ep）")
     parser.add_argument("--vis_deterministic", action="store_true", help="可视化用 greedy(argmax) 动作（不加则按策略采样）")
 
+    # ========== 策略条件化参数 ==========
+    parser.add_argument(
+        "--policy_condition_on_lambda", type=lambda x: x.lower() == "true", default=False,
+        help="是否将拉格朗日乘子 lambda 添加到策略观测中（默认 False）"
+    )
+    parser.add_argument(
+        "--policy_condition_on_budget", type=lambda x: x.lower() == "true", default=False,
+        help="是否将预算信息添加到策略观测中（默认 False）"
+    )
+    parser.add_argument(
+        "--lambda_obs_clip", type=float, default=None,
+        help="lambda 观测特征的裁剪上限（None 表示不裁剪）"
+    )
+
     return parser.parse_args()
 
 
@@ -594,7 +608,18 @@ def rollout_for_viz(agent, env, seed: int, deterministic: bool):
     with torch.no_grad():
         for _ in range(max_steps):
             if deterministic:
-                obs_t = torch.tensor(obs, dtype=torch.float32, device=agent.device).unsqueeze(0)
+                # 需要从 agent 或环境获取预算和 lambda 信息
+                # 从 agent.cfg.cost_budgets 和 agent.lambdas 获取
+                obs_in = augment_obs_with_context(
+                    obs,
+                    agent.cfg.cost_budgets.get("energy", 0.0),
+                    agent.cfg.cost_budgets.get("load", 0.0),
+                    agent.lambdas,
+                    include_budget=getattr(agent.cfg, "policy_condition_on_budget", False),
+                    include_lambda=getattr(agent.cfg, "policy_condition_on_lambda", False),
+                    lambda_clip=getattr(agent.cfg, "lambda_obs_clip", None)
+                )
+                obs_t = torch.tensor(obs_in, dtype=torch.float32, device=agent.device).unsqueeze(0)
                 if action_mask is not None:
                     mask_t = torch.tensor(action_mask, dtype=torch.bool, device=agent.device).unsqueeze(0)
                 else:
@@ -602,7 +627,17 @@ def rollout_for_viz(agent, env, seed: int, deterministic: bool):
                 logits, _, _ = agent.network.forward(obs_t, mask_t)
                 action = int(torch.argmax(logits, dim=-1).item())
             else:
-                action, _, _, _, _ = agent.select_action(obs, action_mask=action_mask)
+                # stochastic 模式也需要增强观测
+                obs_in = augment_obs_with_context(
+                    obs,
+                    agent.cfg.cost_budgets.get("energy", 0.0),
+                    agent.cfg.cost_budgets.get("load", 0.0),
+                    agent.lambdas,
+                    include_budget=getattr(agent.cfg, "policy_condition_on_budget", False),
+                    include_lambda=getattr(agent.cfg, "policy_condition_on_lambda", False),
+                    lambda_clip=getattr(agent.cfg, "lambda_obs_clip", None)
+                )
+                action, _, _, _, _ = agent.select_action(obs_in, action_mask=action_mask)
 
             obs, _, terminated, truncated, info = env.step(action)
             action_mask = info.get("action_mask", None)
@@ -679,7 +714,9 @@ def main():
     # ========== 构建独立的 eval_env 用于可视化 ==========
     eval_env = _build_env(args)
 
-    obs_dim = env.observation_space.shape[0]
+    base_obs_dim = env.observation_space.shape[0]
+    context_dim = (2 if args.policy_condition_on_budget else 0) + (2 if args.policy_condition_on_lambda else 0)
+    obs_dim = base_obs_dim + context_dim
     act_dim = env.action_space.n
 
     # ========== 加载训练 seed 列表（用于 seed replay / curriculum） ==========
@@ -740,7 +777,11 @@ def main():
         f"(radius={args.energy_patch_radius}, "
         f"dim={energy_dim})"
     )
-    print(f"Observation dim: {obs_dim}")
+    print(f"Observation dim: {obs_dim} (base={base_obs_dim}, context={context_dim})")
+    if args.policy_condition_on_budget or args.policy_condition_on_lambda:
+        print(f"  Policy conditioning: budget={args.policy_condition_on_budget}, lambda={args.policy_condition_on_lambda}")
+        if args.lambda_obs_clip is not None:
+            print(f"  Lambda obs clip: {args.lambda_obs_clip}")
     print(f"Mode: {'Lagrange (adaptive lambda)' if args.use_lagrange else 'Fixed lambda (penalty)'}")
     print(f"Budgets: energy={args.energy_budget:.3f}, load={args.load_budget:.3f}")
     print(f"Initial lambda: energy={args.initial_lambda_energy:.3f}, "
@@ -875,6 +916,11 @@ def main():
 
     # ========== 创建 Agent ==========
     agent = MultiCriticPPO(config)
+    
+    # ========== 将策略条件化参数存储到 agent.cfg 以便后续使用 ==========
+    agent.cfg.policy_condition_on_budget = args.policy_condition_on_budget
+    agent.cfg.policy_condition_on_lambda = args.policy_condition_on_lambda
+    agent.cfg.lambda_obs_clip = args.lambda_obs_clip
 
     # ========== 课程学习调度器 ==========
     curriculum_scheduler = None
@@ -988,9 +1034,20 @@ def main():
         
         # 收集 rollout
         for _ in range(config.batch_size):
+            # 增强观测（添加预算和 lambda 信息）
+            obs_in = augment_obs_with_context(
+                obs, 
+                args.energy_budget, 
+                args.load_budget, 
+                agent.lambdas,
+                include_budget=args.policy_condition_on_budget,
+                include_lambda=args.policy_condition_on_lambda,
+                lambda_clip=args.lambda_obs_clip
+            )
+            
             # 选择动作
             action, log_prob, v_reward, v_costs = agent.select_action(
-                obs, action_mask=action_mask
+                obs_in, action_mask=action_mask
             )
 
             # 执行动作
@@ -1004,7 +1061,7 @@ def main():
 
             # 存储 transition
             agent.collect_rollout(
-                obs=obs,
+                obs=obs_in,
                 action=action,
                 reward=reward,
                 done=done,

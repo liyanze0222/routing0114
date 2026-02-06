@@ -3,9 +3,8 @@ setlocal enabledelayedexpansion
 
 REM =======================
 REM E2: Cost critic ablation
-REM   A) separate (main)
-REM   B) shared (shared cost head)
-REM   C) aggregated (single combined constraint)
+REM   A) separate vs B) shared : seeds 0-4, iters 400
+REM   C) aggregated sweep      : seeds 0-2, wE in {0.2,0.5,0.8}, iters 400
 REM =======================
 
 set "SCRIPT=train_grid_structured_lagrangian.py"
@@ -30,12 +29,12 @@ set "INC_E_OBS=True"
 set "E_R=1"
 set "OBS_RMS=True"
 
-REM ---- Budgets ----
+REM ---- Budgets (main) ----
 set "E_BUDGET=0.10"
 set "L_BUDGET=0.05"
 
 REM ---- PPO ----
-set "ITERS=800"
+set "ITERS=400"
 set "BATCH=4096"
 set "MB=256"
 set "EPOCHS=10"
@@ -66,10 +65,15 @@ set "DUAL_PRECOND_CLIP=2.0"
 set "DUAL_PRECOND_STRENGTH=0.3"
 set "DUAL_PRECOND_USE_EMA_STATS=True"
 
-REM ---- aggregated params ----
+REM ---- Seeds ----
+set "SEEDS=0 1 2 3 4"
+
+REM ---- Aggregated sweep ----
+set "AGG_WE_LIST=0.2 0.5 0.8"
 set "AGG_NORM=True"
-set "AGG_WE=0.5"
-set "AGG_WL=0.5"
+
+REM ---- S4 (if supported) ----
+set "TRAIN_BUFFER_EPISODES=100"
 
 REM ---- Logging ----
 set "LOG_ACTOR_DECOMP=True"
@@ -77,15 +81,15 @@ set "LOG_ACTOR_GRAD_DECOMP=False"
 set "GRAD_DECOMP_INTERVAL=100"
 set "LOG_INTERVAL=10"
 
-for %%S in (0) do (
+for %%S in (%SEEDS%) do (
 
-  REM -------- A) separate --------
+  REM ============ A) separate ============
   echo ==========================================================
-  echo [E2-A separate] seed=%%S
+  echo [E2-A separate] seed=%%S  EB=%E_BUDGET%  LB=%L_BUDGET%
   echo ==========================================================
   python %SCRIPT% ^
     --output_dir "%OUTDIR%" ^
-    --run_tag "A_separate_seed%%S" ^
+    --run_tag "E2_separate_seed%%S" ^
     --seed %%S ^
     --total_iters %ITERS% ^
     --batch_size %BATCH% ^
@@ -149,15 +153,16 @@ for %%S in (0) do (
     --log_actor_decomp %LOG_ACTOR_DECOMP% ^
     --log_actor_grad_decomp %LOG_ACTOR_GRAD_DECOMP% ^
     --grad_decomp_interval %GRAD_DECOMP_INTERVAL% ^
-    --log_interval %LOG_INTERVAL%
+    --log_interval %LOG_INTERVAL% ^
+    --train_buffer_episodes %TRAIN_BUFFER_EPISODES%
 
-  REM -------- B) shared --------
+  REM ============ B) shared ============
   echo ==========================================================
-  echo [E2-B shared] seed=%%S
+  echo [E2-B shared] seed=%%S  EB=%E_BUDGET%  LB=%L_BUDGET%
   echo ==========================================================
   python %SCRIPT% ^
     --output_dir "%OUTDIR%" ^
-    --run_tag "B_shared_seed%%S" ^
+    --run_tag "E2_shared_seed%%S" ^
     --seed %%S ^
     --total_iters %ITERS% ^
     --batch_size %BATCH% ^
@@ -221,83 +226,93 @@ for %%S in (0) do (
     --log_actor_decomp %LOG_ACTOR_DECOMP% ^
     --log_actor_grad_decomp %LOG_ACTOR_GRAD_DECOMP% ^
     --grad_decomp_interval %GRAD_DECOMP_INTERVAL% ^
-    --log_interval %LOG_INTERVAL%
+    --log_interval %LOG_INTERVAL% ^
+    --train_buffer_episodes %TRAIN_BUFFER_EPISODES%
 
-  REM -------- C) aggregated --------
-  echo ==========================================================
-  echo [E2-C aggregated] seed=%%S  (wE=%AGG_WE% wL=%AGG_WL% norm=%AGG_NORM%)
-  echo ==========================================================
-  python %SCRIPT% ^
-    --output_dir "%OUTDIR%" ^
-    --run_tag "C_aggregated_seed%%S_wE%AGG_WE%_wL%AGG_WL%" ^
-    --seed %%S ^
-    --total_iters %ITERS% ^
-    --batch_size %BATCH% ^
-    --minibatch_size %MB% ^
-    --update_epochs %EPOCHS% ^
-    --hidden_dim %HIDDEN% ^
-    --lr %LR% ^
-    --gamma %GAMMA% ^
-    --gae_lambda %GAE% ^
-    --clip_coef %CLIP% ^
-    --ent_coef %ENT% ^
-    --value_coef %VF% ^
-    --cost_value_coef %COST_VF% ^
-    --max_grad_norm %MAXGN% ^
-    --grid_size %GRID% ^
-    --max_steps %MAX_STEPS% ^
-    --step_penalty %STEP_P% ^
-    --success_reward %SUCCESS_R% ^
-    --energy_high_density %ENERGY_HIGH_DENS% ^
-    --congestion_pattern %CONG_PATTERN% ^
-    --congestion_density %CONG_DENS% ^
-    --randomize_maps_each_reset %RANDOMIZE_MAPS% ^
-    --load_threshold %LOAD_TAU% ^
-    --start_goal_mode %START_GOAL_MODE% ^
-    --start_rect %START_RECT% ^
-    --goal_rect %GOAL_RECT% ^
-    --include_congestion_obs %INC_CONG_OBS% ^
-    --congestion_patch_radius %CONG_R% ^
-    --include_energy_obs %INC_E_OBS% ^
-    --energy_patch_radius %E_R% ^
-    --obs_rms %OBS_RMS% ^
-    --use_lagrange True ^
-    --initial_lambda_energy 0.0 ^
-    --initial_lambda_load 0.0 ^
-    --energy_budget %E_BUDGET% ^
-    --load_budget %L_BUDGET% ^
-    --lambda_gap_mode %GAP_MODE% ^
-    --lambda_lr %LAMBDA_LR% ^
-    --lambda_lr_energy %LAMBDA_LR% ^
-    --lambda_lr_load %LAMBDA_LR% ^
-    --lambda_update_freq %LAMBDA_UPDATE_FREQ% ^
-    --lambda_max %LAMBDA_MAX% ^
-    --risk_factor %RISK_FACTOR% ^
-    --dual_update_mode %DUAL_MODE% ^
-    --dual_gap_ema_beta %DUAL_GAP_EMA% ^
-    --dual_corr_ema_beta %DUAL_CORR_EMA% ^
-    --dual_deadband %DUAL_DEADBAND% ^
-    --dual_lr_down_scale %DUAL_LR_DOWN% ^
-    --dual_precond_eps %DUAL_PRECOND_EPS% ^
-    --dual_precond_clip %DUAL_PRECOND_CLIP% ^
-    --dual_precond_strength %DUAL_PRECOND_STRENGTH% ^
-    --dual_precond_use_ema_stats %DUAL_PRECOND_USE_EMA_STATS% ^
-    --cost_critic_mode aggregated ^
-    --agg_cost_normalize_by_budget %AGG_NORM% ^
-    --agg_cost_w_energy %AGG_WE% ^
-    --agg_cost_w_load %AGG_WL% ^
-    --value_head_mode standard ^
-    --enable_best_checkpoint True ^
-    --best_checkpoint_success_thresh 0.95 ^
-    --best_window_fsr 50 ^
-    --best_window_tail 50 ^
-    --tail_percentile 95 ^
-    --enable_early_stop False ^
-    --log_actor_decomp %LOG_ACTOR_DECOMP% ^
-    --log_actor_grad_decomp %LOG_ACTOR_GRAD_DECOMP% ^
-    --grad_decomp_interval %GRAD_DECOMP_INTERVAL% ^
-    --log_interval %LOG_INTERVAL%
+  REM ============ C) aggregated (seed 0-2, sweep wE) ============
+  if %%S LEQ 2 (
+    for %%W in (%AGG_WE_LIST%) do (
+      set "AGG_WE=%%W"
+      if "%%W"=="0.2" set "AGG_WL=0.8"
+      if "%%W"=="0.5" set "AGG_WL=0.5"
+      if "%%W"=="0.8" set "AGG_WL=0.2"
 
+      echo ==========================================================
+      echo [E2-C aggregated] seed=%%S  wE=!AGG_WE! wL=!AGG_WL! norm=%AGG_NORM%
+      echo ==========================================================
+      python %SCRIPT% ^
+        --output_dir "%OUTDIR%" ^
+        --run_tag "E2_aggregated_seed%%S_wE!AGG_WE!_wL!AGG_WL!" ^
+        --seed %%S ^
+        --total_iters %ITERS% ^
+        --batch_size %BATCH% ^
+        --minibatch_size %MB% ^
+        --update_epochs %EPOCHS% ^
+        --hidden_dim %HIDDEN% ^
+        --lr %LR% ^
+        --gamma %GAMMA% ^
+        --gae_lambda %GAE% ^
+        --clip_coef %CLIP% ^
+        --ent_coef %ENT% ^
+        --value_coef %VF% ^
+        --cost_value_coef %COST_VF% ^
+        --max_grad_norm %MAXGN% ^
+        --grid_size %GRID% ^
+        --max_steps %MAX_STEPS% ^
+        --step_penalty %STEP_P% ^
+        --success_reward %SUCCESS_R% ^
+        --energy_high_density %ENERGY_HIGH_DENS% ^
+        --congestion_pattern %CONG_PATTERN% ^
+        --congestion_density %CONG_DENS% ^
+        --randomize_maps_each_reset %RANDOMIZE_MAPS% ^
+        --load_threshold %LOAD_TAU% ^
+        --start_goal_mode %START_GOAL_MODE% ^
+        --start_rect %START_RECT% ^
+        --goal_rect %GOAL_RECT% ^
+        --include_congestion_obs %INC_CONG_OBS% ^
+        --congestion_patch_radius %CONG_R% ^
+        --include_energy_obs %INC_E_OBS% ^
+        --energy_patch_radius %E_R% ^
+        --obs_rms %OBS_RMS% ^
+        --use_lagrange True ^
+        --initial_lambda_energy 0.0 ^
+        --initial_lambda_load 0.0 ^
+        --energy_budget %E_BUDGET% ^
+        --load_budget %L_BUDGET% ^
+        --lambda_gap_mode %GAP_MODE% ^
+        --lambda_lr %LAMBDA_LR% ^
+        --lambda_lr_energy %LAMBDA_LR% ^
+        --lambda_lr_load %LAMBDA_LR% ^
+        --lambda_update_freq %LAMBDA_UPDATE_FREQ% ^
+        --lambda_max %LAMBDA_MAX% ^
+        --risk_factor %RISK_FACTOR% ^
+        --dual_update_mode %DUAL_MODE% ^
+        --dual_gap_ema_beta %DUAL_GAP_EMA% ^
+        --dual_corr_ema_beta %DUAL_CORR_EMA% ^
+        --dual_deadband %DUAL_DEADBAND% ^
+        --dual_lr_down_scale %DUAL_LR_DOWN% ^
+        --dual_precond_eps %DUAL_PRECOND_EPS% ^
+        --dual_precond_clip %DUAL_PRECOND_CLIP% ^
+        --dual_precond_strength %DUAL_PRECOND_STRENGTH% ^
+        --dual_precond_use_ema_stats %DUAL_PRECOND_USE_EMA_STATS% ^
+        --cost_critic_mode aggregated ^
+        --agg_cost_normalize_by_budget %AGG_NORM% ^
+        --agg_cost_w_energy !AGG_WE! ^
+        --agg_cost_w_load !AGG_WL! ^
+        --value_head_mode standard ^
+        --enable_best_checkpoint True ^
+        --best_checkpoint_success_thresh 0.95 ^
+        --best_window_fsr 50 ^
+        --best_window_tail 50 ^
+        --tail_percentile 95 ^
+        --enable_early_stop False ^
+        --log_actor_decomp %LOG_ACTOR_DECOMP% ^
+        --log_actor_grad_decomp %LOG_ACTOR_GRAD_DECOMP% ^
+        --grad_decomp_interval %GRAD_DECOMP_INTERVAL% ^
+        --log_interval %LOG_INTERVAL% ^
+        --train_buffer_episodes %TRAIN_BUFFER_EPISODES%
+    )
+  )
 )
 
 echo Done.
